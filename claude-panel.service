@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Code Control Panel (GTK3 + Tray Icon)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/smlflg/Projekte/ClaudeCodePanel/panel.py
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target

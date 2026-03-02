@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Claude Code Panel
+Comment=Control Panel fuer Claude Code — Settings, Hooks, Sessions, Skills
+Exec=python3 /home/smlflg/Projekte/ClaudeCodePanel/panel.py
+Icon=preferences-system
+Terminal=false
+Type=Application
+Categories=Development;Settings;
+Keywords=claude;code;settings;panel;ai;
+StartupWMClass=claude-code-panel
