@@ -116,10 +116,16 @@ def get_anthropic_session_cost() -> dict:
     if SESSION_META_DIR.is_dir():
         for f in SESSION_META_DIR.glob("*.json"):
             try:
-                mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-                if mtime.strftime("%Y-%m-%d") != today:
-                    continue
                 data = json.loads(f.read_text())
+                # Prefer start_time field, fallback to file mtime
+                start = data.get("start_time", "")
+                if start:
+                    date_str = start[:10]  # "2026-03-03T..." -> "2026-03-03"
+                else:
+                    mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                    date_str = mtime.strftime("%Y-%m-%d")
+                if date_str != today:
+                    continue
                 total_input += data.get("input_tokens", 0)
                 total_output += data.get("output_tokens", 0)
                 session_count += 1
@@ -371,9 +377,14 @@ def get_usage_timeline() -> list[dict]:
     if SESSION_META_DIR.is_dir():
         for f in SESSION_META_DIR.glob("*.json"):
             try:
-                mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-                date_str = mtime.strftime("%Y-%m-%d")
                 data = json.loads(f.read_text())
+                # Prefer start_time field, fallback to file mtime
+                start = data.get("start_time", "")
+                if start:
+                    date_str = start[:10]
+                else:
+                    mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                    date_str = mtime.strftime("%Y-%m-%d")
                 inp = data.get("input_tokens", 0)
                 out = data.get("output_tokens", 0)
                 rate_in, rate_out = ANTHROPIC_PRICING["opus"]

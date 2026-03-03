@@ -745,17 +745,17 @@ class ControlPanel(Gtk.Window):
             else:
                 self._no_sessions_label.show()
 
-            # Usage timeline — update fixed slots
+            # Usage timeline — update fixed slots (token-based costs)
             timeline = get_usage_timeline()
-            max_calls = max((t["calls"] for t in timeline), default=1) or 1
+            max_cost = max((t["cost_est"] for t in timeline), default=0.01) or 0.01
 
             for i, slot in enumerate(self._timeline_slots):
                 if i < len(timeline):
                     t = timeline[i]
                     slot["date"].set_text(t["date"])
-                    bar_len = int((t["calls"] / max_calls) * 30)
+                    bar_len = max(1, int((t["cost_est"] / max_cost) * 30)) if t["cost_est"] > 0 else 0
                     slot["bar"].set_text("\u2588" * bar_len)
-                    slot["count"].set_text(f"{t['calls']} calls")
+                    slot["count"].set_text(f"${t['cost_est']:.2f}")
                     slot["row"].show_all()
                 else:
                     slot["row"].hide()
@@ -1311,7 +1311,7 @@ class ControlPanel(Gtk.Window):
         idle_once(self._refresh_cost)
 
     def _refresh_cost(self) -> bool:
-        """Refresh cost tab data."""
+        """Refresh cost tab data with real token-based costs."""
         try:
             cost_data = get_daily_cost()
             if "error" not in cost_data:
@@ -1321,9 +1321,13 @@ class ControlPanel(Gtk.Window):
             else:
                 self.cost_total_label.set_text("N/A")
 
-            # Provider breakdown
+            # Provider breakdown with token details
             provider_costs = get_provider_costs()
             total_p = sum(provider_costs.values()) or 0.001
+            anthropic_data = get_anthropic_session_cost()
+            # Providers with estimated costs get "~" prefix
+            estimated_providers = {"codex", "gemini"}
+
             for name, slot in self._cost_provider_slots.items():
                 cost = provider_costs.get(name, 0.0)
                 if cost > 0:
@@ -1332,23 +1336,33 @@ class ControlPanel(Gtk.Window):
                     slot["bar"].set_markup(
                         f'<span foreground="{slot["color"]}">{"\u2588" * bar_len}</span>'
                     )
-                    slot["cost"].set_text(f"${cost:.4f} ({pct:.0f}%)")
+                    prefix = "~" if name in estimated_providers else ""
+                    if name == "anthropic" and anthropic_data["sessions"] > 0:
+                        inp_k = anthropic_data["input_tokens"] / 1000
+                        out_k = anthropic_data["output_tokens"] / 1000
+                        slot["cost"].set_text(
+                            f"${cost:.4f} ({inp_k:.0f}K in / {out_k:.0f}K out)"
+                        )
+                    else:
+                        slot["cost"].set_text(f"{prefix}${cost:.4f} ({pct:.0f}%)")
                 else:
                     slot["bar"].set_text("")
                     slot["cost"].set_text("—")
 
-            # Timeline
+            # Timeline — token-based costs
             timeline = get_usage_timeline()
-            max_calls = max((t["calls"] for t in timeline), default=1) or 1
+            max_cost = max((t["cost_est"] for t in timeline), default=0.01) or 0.01
             for i, slot in enumerate(self._cost_timeline_slots):
                 if i < len(timeline):
                     t = timeline[i]
                     slot["date"].set_text(t["date"])
-                    bar_len = int((t["calls"] / max_calls) * 25)
+                    bar_len = max(1, int((t["cost_est"] / max_cost) * 25))
                     slot["bar"].set_markup(
                         f'<span foreground="#89b4fa">{"\u2588" * bar_len}</span>'
                     )
-                    slot["info"].set_text(f'{t["calls"]} calls  ~${t["cost_est"]:.3f}')
+                    slot["info"].set_text(
+                        f'{t["calls"]} calls  ${t["cost_est"]:.3f}'
+                    )
                     slot["row"].show_all()
                 else:
                     slot["row"].hide()
