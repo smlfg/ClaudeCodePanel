@@ -5,6 +5,7 @@ Auto-refreshes via external timer calling refresh_logs().
 """
 
 import json
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 
@@ -89,33 +90,36 @@ def build_logs_tab() -> Gtk.ScrolledWindow:
 def refresh_logs() -> bool:
     """Refresh log data from disk. Returns True to keep timer alive."""
     global _last_fingerprint
-    if _log_box is None:
-        return True
+    try:
+        if _log_box is None:
+            return True
 
-    entries = _read_usage_entries() + _read_coaching_entries()
-    # Sort by timestamp descending
-    entries.sort(key=lambda e: e.get("_sort_key", ""), reverse=True)
-    entries = entries[:_MAX_ENTRIES]
+        entries = _read_usage_entries() + _read_coaching_entries()
+        # Sort by timestamp descending
+        entries.sort(key=lambda e: e.get("_sort_key", ""), reverse=True)
+        entries = entries[:_MAX_ENTRIES]
 
-    # Only rebuild if content changed (count + latest sort key)
-    fingerprint = (entries[0].get("_sort_key", "") if entries else "", len(entries))
-    if fingerprint == _last_fingerprint:
+        # Only rebuild if content changed (count + latest sort key)
+        fingerprint = (entries[0].get("_sort_key", "") if entries else "", len(entries))
+        if fingerprint == _last_fingerprint:
+            _update_stats(entries)
+            return True
+
+        _last_fingerprint = fingerprint
+
+        # Clear and rebuild
+        for child in _log_box.get_children():
+            _log_box.remove(child)
+
+        for entry in entries:
+            row = _build_log_row(entry)
+            _log_box.pack_start(row, False, False, 0)
+
+        _log_box.show_all()
+        _apply_filter()
         _update_stats(entries)
-        return True
-
-    _last_fingerprint = fingerprint
-
-    # Clear and rebuild
-    for child in _log_box.get_children():
-        _log_box.remove(child)
-
-    for entry in entries:
-        row = _build_log_row(entry)
-        _log_box.pack_start(row, False, False, 0)
-
-    _log_box.show_all()
-    _apply_filter()
-    _update_stats(entries)
+    except Exception:
+        pass  # keep timer alive
     return True
 
 
@@ -145,14 +149,19 @@ def _read_usage_entries() -> list[dict]:
 
 
 def _read_coaching_entries() -> list[dict]:
-    """Read last 20 lines from coaching log as hook entries."""
+    """Read last 20 lines from coaching log as hook entries.
+
+    Uses a deque with maxlen=20 so only the tail of the file is kept in memory,
+    avoiding a full read_text() on potentially large log files.
+    """
     if not COACHING_LOG.exists():
         return []
 
     entries = []
     try:
-        lines = COACHING_LOG.read_text().strip().split("\n")
-        for line in lines[-20:]:
+        with COACHING_LOG.open() as f:
+            last_lines = deque(f, maxlen=20)
+        for line in last_lines:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue

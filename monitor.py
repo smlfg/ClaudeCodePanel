@@ -8,29 +8,53 @@ Single combined scan for active + recent sessions.
 Session previews cached permanently (content never changes).
 """
 
+import importlib.util
 import json
-import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Add MyAIGame root to path so `tui.data.*` imports resolve
-_MYAIGAME_ROOT = Path.home() / "Projekte" / "MyAIGame"
-if _MYAIGAME_ROOT.exists() and str(_MYAIGAME_ROOT) not in sys.path:
-    sys.path.insert(0, str(_MYAIGAME_ROOT))
 
-# Try importing from TUI data layer
+def _load_usage_reader():
+    """Load usage_reader from MyAIGame if available, without sys.path manipulation."""
+    module_path = Path.home() / "Projekte" / "MyAIGame" / "tui" / "data" / "usage_reader.py"
+    if not module_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("usage_reader", module_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_skill_tracker():
+    """Load skill_tracker from MyAIGame if available, without sys.path manipulation."""
+    module_path = Path.home() / "Projekte" / "MyAIGame" / "tui" / "data" / "skill_tracker.py"
+    if not module_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("skill_tracker", module_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Try loading TUI data modules via explicit importlib (avoids sys.path DLL-hijacking)
+_usage_reader_mod = None
 try:
-    from tui.data.usage_reader import get_daily_summary, get_top_n
-    _HAS_USAGE_READER = True
-except ImportError:
+    _usage_reader_mod = _load_usage_reader()
+    _HAS_USAGE_READER = _usage_reader_mod is not None
+except Exception:
     _HAS_USAGE_READER = False
 
+_skill_tracker_mod = None
 try:
-    from tui.data.skill_tracker import get_missed_today
-    _HAS_SKILL_TRACKER = True
-except ImportError:
+    _skill_tracker_mod = _load_skill_tracker()
+    _HAS_SKILL_TRACKER = _skill_tracker_mod is not None
+except Exception:
     _HAS_SKILL_TRACKER = False
 
 
@@ -60,19 +84,94 @@ def _cache_set(key, value):
 
 
 # ---------------------------------------------------------------------------
+# Anthropic token pricing (per 1M tokens)
+# ---------------------------------------------------------------------------
+ANTHROPIC_PRICING = {
+    "opus":   (15.0, 75.0),   # (input_$/1M, output_$/1M)
+    "sonnet": (3.0,  15.0),
+    "haiku":  (0.80,  4.0),
+}
+
+SESSION_META_DIR = Path.home() / ".claude" / "usage-data" / "session-meta"
+
+
+# ---------------------------------------------------------------------------
 # Cost & Tools
 # ---------------------------------------------------------------------------
+def get_anthropic_session_cost() -> dict:
+    """Read real token counts from Claude Code session metadata (cached 30s).
+
+    Scans ~/.claude/usage-data/session-meta/*.json for today's sessions,
+    sums input/output tokens, and calculates cost at Opus rates.
+    """
+    cached = _cache_get("anthropic_session_cost")
+    if cached is not None:
+        return cached
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total_input = 0
+    total_output = 0
+    session_count = 0
+
+    if SESSION_META_DIR.is_dir():
+        for f in SESSION_META_DIR.glob("*.json"):
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                if mtime.strftime("%Y-%m-%d") != today:
+                    continue
+                data = json.loads(f.read_text())
+                total_input += data.get("input_tokens", 0)
+                total_output += data.get("output_tokens", 0)
+                session_count += 1
+            except (OSError, json.JSONDecodeError, KeyError):
+                continue
+
+    # Default: Opus pricing (conservative — better too high than too low)
+    rate_in, rate_out = ANTHROPIC_PRICING["opus"]
+    cost = (total_input * rate_in + total_output * rate_out) / 1_000_000
+
+    result = {
+        "cost_usd": round(cost, 4),
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "sessions": session_count,
+    }
+    _cache_set("anthropic_session_cost", result)
+    return result
+
+
+def _get_tool_call_stats() -> dict:
+    """Get tool call count and unique tool count from usage-tracker data."""
+    if not _HAS_USAGE_READER:
+        return {"total_calls": 0, "unique_tools": 0}
+    try:
+        summary = _usage_reader_mod.get_daily_summary()
+        return {
+            "total_calls": summary.get("total_calls", 0),
+            "unique_tools": summary.get("unique_tools", 0),
+        }
+    except Exception:
+        return {"total_calls": 0, "unique_tools": 0}
+
+
 def get_daily_cost() -> dict:
-    """Get today's cost summary (cached 30s)."""
+    """Get today's cost summary based on real token data (cached 30s)."""
     cached = _cache_get("daily_cost")
     if cached is not None:
         return cached
-    if not _HAS_USAGE_READER:
-        return {"error": "usage_reader nicht verfuegbar", "cost_estimate_usd": 0.0}
-    try:
-        result = get_daily_summary()
-    except Exception as e:
-        result = {"error": str(e), "cost_estimate_usd": 0.0}
+
+    provider_costs = get_provider_costs()
+    total = sum(provider_costs.values())
+
+    # Tool-call count for statistics (not for cost calculation)
+    tool_stats = _get_tool_call_stats()
+
+    result = {
+        "cost_estimate_usd": round(total, 4),
+        "total_calls": tool_stats["total_calls"],
+        "unique_tools": tool_stats["unique_tools"],
+        "source": "token-based",
+    }
     _cache_set("daily_cost", result)
     return result
 
@@ -85,7 +184,7 @@ def get_top_tools(n: int = 5) -> list[tuple[str, int]]:
     if not _HAS_USAGE_READER:
         return []
     try:
-        result = get_top_n(n)
+        result = _usage_reader_mod.get_top_n(n)
     except Exception:
         result = []
     _cache_set(f"top_tools_{n}", result)
@@ -219,7 +318,7 @@ def get_missed_skills() -> list[dict]:
     if not _HAS_SKILL_TRACKER:
         return []
     try:
-        return get_missed_today()
+        return _skill_tracker_mod.get_missed_today()
     except Exception:
         return []
 
@@ -243,30 +342,61 @@ def get_missed_skills_summary() -> list[tuple[str, int]]:
 # Timeline
 # ---------------------------------------------------------------------------
 def get_usage_timeline() -> list[dict]:
-    """Get usage data files sorted by date (last 7 days, cached 30s)."""
+    """Get usage data by date (last 7 days, cached 30s).
+
+    Combines tool-call counts from usage-tracker JSONL files with
+    real token costs from session-meta (grouped by mtime date).
+    """
     cached = _cache_get("usage_timeline")
     if cached is not None:
         return cached
 
-    if not USAGE_DIR.exists():
-        _cache_set("usage_timeline", [])
-        return []
+    # 1. Collect call counts per day from usage-tracker JSONL
+    calls_by_date: dict[str, int] = {}
+    if USAGE_DIR.exists():
+        for f in sorted(USAGE_DIR.glob("????-??-??.jsonl"), reverse=True)[:7]:
+            count = 0
+            try:
+                with f.open() as fh:
+                    for line in fh:
+                        if line.strip():
+                            count += 1
+            except OSError:
+                pass
+            calls_by_date[f.stem] = count
 
-    files = sorted(USAGE_DIR.glob("????-??-??.jsonl"), reverse=True)[:7]
+    # 2. Collect token costs per day from session-meta
+    costs_by_date: dict[str, float] = {}
+    tokens_by_date: dict[str, tuple[int, int]] = {}  # date -> (in, out)
+    if SESSION_META_DIR.is_dir():
+        for f in SESSION_META_DIR.glob("*.json"):
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                date_str = mtime.strftime("%Y-%m-%d")
+                data = json.loads(f.read_text())
+                inp = data.get("input_tokens", 0)
+                out = data.get("output_tokens", 0)
+                rate_in, rate_out = ANTHROPIC_PRICING["opus"]
+                cost = (inp * rate_in + out * rate_out) / 1_000_000
+                costs_by_date[date_str] = costs_by_date.get(date_str, 0.0) + cost
+                prev_in, prev_out = tokens_by_date.get(date_str, (0, 0))
+                tokens_by_date[date_str] = (prev_in + inp, prev_out + out)
+            except (OSError, json.JSONDecodeError, KeyError):
+                continue
+
+    # 3. Merge: all dates from both sources, sorted desc, limit 7
+    all_dates = sorted(set(calls_by_date) | set(costs_by_date), reverse=True)[:7]
     timeline = []
-    for f in files:
-        count = 0
-        try:
-            with f.open() as fh:
-                for line in fh:
-                    if line.strip():
-                        count += 1
-        except (OSError, json.JSONDecodeError):
-            pass
+    for date_str in all_dates:
+        calls = calls_by_date.get(date_str, 0)
+        cost = costs_by_date.get(date_str, 0.0)
+        inp, out = tokens_by_date.get(date_str, (0, 0))
         timeline.append({
-            "date": f.stem,
-            "calls": count,
-            "cost_est": round(count * 0.003, 4),
+            "date": date_str,
+            "calls": calls,
+            "cost_est": round(cost, 4),
+            "input_tokens": inp,
+            "output_tokens": out,
         })
 
     _cache_set("usage_timeline", timeline)
@@ -276,16 +406,19 @@ def get_usage_timeline() -> list[dict]:
 def get_provider_costs() -> dict[str, float]:
     """Get today's cost breakdown by provider (cached 30s).
 
-    Reads ~/.claude/usage/providers.jsonl for provider-specific costs.
-    Returns: {"anthropic": 1.23, "minimax": 0.05, "codex": 0.12, "gemini": 0.01}
+    Anthropic: real tokens from session-meta (no more flat-rate fiction).
+    Others: from ~/.claude/usage/providers.jsonl (minimax, codex, gemini).
     """
     cached = _cache_get("provider_costs")
     if cached is not None:
         return cached
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    costs: dict[str, float] = {}
+    # 1. Anthropic: real token cost from session-meta
+    anthropic = get_anthropic_session_cost()
+    costs: dict[str, float] = {"anthropic": anthropic["cost_usd"]}
 
+    # 2. Other providers: from providers.jsonl
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     providers_file = USAGE_DIR / "providers.jsonl"
     if providers_file.exists():
         try:
@@ -305,16 +438,6 @@ def get_provider_costs() -> dict[str, float]:
                         continue
         except OSError:
             pass
-
-    # Add Anthropic cost estimate from generic usage data
-    # (Tool calls not covered by specific providers are assumed Anthropic)
-    generic_cost = get_daily_cost()
-    if "error" not in generic_cost:
-        total_generic = generic_cost.get("cost_estimate_usd", 0.0)
-        provider_total = sum(costs.values())
-        anthropic_est = max(0.0, total_generic - provider_total)
-        if anthropic_est > 0:
-            costs["anthropic"] = round(anthropic_est, 6)
 
     # Round all values
     costs = {k: round(v, 6) for k, v in costs.items()}

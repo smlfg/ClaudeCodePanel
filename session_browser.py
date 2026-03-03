@@ -35,11 +35,14 @@ MAX_SESSIONS = 20
 
 # ---------------------------------------------------------------------------
 # Module-level state (kept between refreshes)
+# Grouped into a single namespace dict to avoid scattered globals.
 # ---------------------------------------------------------------------------
-_list_box: Gtk.ListBox | None = None
-_stats_label: Gtk.Label | None = None
-_search_entry: Gtk.SearchEntry | None = None
-_all_sessions: list[dict] = []
+_state: dict = {
+    "list_box": None,       # Gtk.ListBox | None
+    "stats_label": None,    # Gtk.Label | None
+    "search_entry": None,   # Gtk.SearchEntry | None
+    "all_sessions": [],     # list[dict]
+}
 
 
 # ---------------------------------------------------------------------------
@@ -272,13 +275,16 @@ def _build_session_row(session: dict) -> Gtk.ListBoxRow:
 def _on_resume_clicked(_btn: Gtk.Button, session_id: str) -> None:
     """Launch kitty terminal with claude -r SESSION_ID."""
     try:
+        # List-form Popen (not shell=True) is safe against injection regardless of
+        # special characters in session_id — each element is passed as a literal argument.
         subprocess.Popen(
             ["kitty", "-e", "claude", "-r", session_id],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        # kitty not found — try fallback terminal via shell
+        # kitty not found — fallback terminal uses shell=False list form too.
+        # shlex.quote is applied to session_id only for the shell=True bash -c string.
         try:
             subprocess.Popen(
                 ["x-terminal-emulator", "-e", "bash", "-c", f"claude -r {shlex.quote(session_id)}"],
@@ -295,9 +301,9 @@ def _on_resume_clicked(_btn: Gtk.Button, session_id: str) -> None:
 
 def _filter_func(row: Gtk.ListBoxRow) -> bool:
     """Return True if row matches current search query."""
-    if _search_entry is None:
+    if _state["search_entry"] is None:
         return True
-    query = _search_entry.get_text().strip().lower()
+    query = _state["search_entry"].get_text().strip().lower()
     if not query:
         return True
     session = getattr(row, "_session_data", None)
@@ -317,26 +323,25 @@ def _filter_func(row: Gtk.ListBoxRow) -> bool:
 
 def _populate_list_box(sessions: list[dict]) -> None:
     """Clear and re-populate the ListBox with new session rows."""
-    global _all_sessions
-    _all_sessions = sessions
+    _state["all_sessions"] = sessions
 
-    if _list_box is None:
+    if _state["list_box"] is None:
         return
 
     # Remove all existing children
-    for child in _list_box.get_children():
-        _list_box.remove(child)
+    for child in _state["list_box"].get_children():
+        _state["list_box"].remove(child)
 
     # Add rows (up to MAX_SESSIONS)
     for session in sessions[:MAX_SESSIONS]:
         row = _build_session_row(session)
-        _list_box.add(row)
+        _state["list_box"].add(row)
 
-    _list_box.show_all()
+    _state["list_box"].show_all()
 
     # Update stats bar
-    if _stats_label is not None:
-        _stats_label.set_text(_compute_stats(sessions))
+    if _state["stats_label"] is not None:
+        _state["stats_label"].set_text(_compute_stats(sessions))
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +360,6 @@ def refresh_sessions() -> bool:
 
 def build_sessions_tab() -> Gtk.ScrolledWindow:
     """Build and return the Sessions tab widget (Gtk.ScrolledWindow)."""
-    global _list_box, _stats_label, _search_entry
 
     # -----------------------------------------------------------------------
     # Root: ScrolledWindow → main VBox
@@ -394,10 +398,10 @@ def build_sessions_tab() -> Gtk.ScrolledWindow:
     toolbar.pack_start(spacer, True, True, 0)
 
     # Search entry
-    _search_entry = Gtk.SearchEntry()
-    _search_entry.set_placeholder_text("Projekt oder Inhalt suchen…")
-    _search_entry.set_size_request(220, -1)
-    toolbar.pack_start(_search_entry, False, False, 0)
+    _state["search_entry"] = Gtk.SearchEntry()
+    _state["search_entry"].set_placeholder_text("Projekt oder Inhalt suchen…")
+    _state["search_entry"].set_size_request(220, -1)
+    toolbar.pack_start(_state["search_entry"], False, False, 0)
 
     # Refresh button
     refresh_btn = Gtk.Button()
@@ -410,24 +414,24 @@ def build_sessions_tab() -> Gtk.ScrolledWindow:
     # -----------------------------------------------------------------------
     # Stats pill (rounded bar instead of frame)
     # -----------------------------------------------------------------------
-    _stats_label = Gtk.Label(label="Lade Sessions…")
-    _stats_label.get_style_context().add_class("session-stats")
-    _stats_label.set_margin_top(2)
-    _stats_label.set_margin_bottom(8)
-    _stats_label.set_halign(Gtk.Align.START)
-    main_vbox.pack_start(_stats_label, False, False, 0)
+    _state["stats_label"] = Gtk.Label(label="Lade Sessions…")
+    _state["stats_label"].get_style_context().add_class("session-stats")
+    _state["stats_label"].set_margin_top(2)
+    _state["stats_label"].set_margin_bottom(8)
+    _state["stats_label"].set_halign(Gtk.Align.START)
+    main_vbox.pack_start(_state["stats_label"], False, False, 0)
 
     # -----------------------------------------------------------------------
     # ListBox for sessions
     # -----------------------------------------------------------------------
-    _list_box = Gtk.ListBox()
-    _list_box.set_selection_mode(Gtk.SelectionMode.NONE)
-    _list_box.set_filter_func(_filter_func)
-    _list_box.get_style_context().add_class("view")
-    main_vbox.pack_start(_list_box, True, True, 0)
+    _state["list_box"] = Gtk.ListBox()
+    _state["list_box"].set_selection_mode(Gtk.SelectionMode.NONE)
+    _state["list_box"].set_filter_func(_filter_func)
+    _state["list_box"].get_style_context().add_class("view")
+    main_vbox.pack_start(_state["list_box"], True, True, 0)
 
     # Connect search to filter
-    _search_entry.connect("search-changed", lambda _e: _list_box.invalidate_filter())
+    _state["search_entry"].connect("search-changed", lambda _e: _state["list_box"].invalidate_filter())
 
     # -----------------------------------------------------------------------
     # Initial load (non-blocking via idle_add)

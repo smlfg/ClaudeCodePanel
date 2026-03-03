@@ -9,6 +9,7 @@ data fetching via GLib.idle_add for non-blocking UI.
 """
 
 import subprocess
+from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -30,6 +31,7 @@ from monitor import (
     get_missed_skills_summary,
     get_usage_timeline,
     get_provider_costs,
+    get_anthropic_session_cost,
     format_cost,
 )
 from log_viewer import build_logs_tab, refresh_logs
@@ -266,18 +268,16 @@ _MAX_TIMELINE_ROWS = 7
 
 def _open_path(path: str) -> None:
     """Open a file or directory with xdg-open."""
-    from pathlib import Path as P
-    resolved = str(P(path).expanduser())
-    subprocess.Popen(["xdg-open", resolved], start_new_session=True)
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        return  # silently skip missing paths
+    subprocess.Popen(["xdg-open", str(resolved)], start_new_session=True)
 
 
 def _run_command(cmd: str) -> None:
-    """Run a shell command in background.
-
-    WARNING: Uses shell=True — only call with trusted, hardcoded commands
-    from the SHORTCUTS list. NEVER pass user-provided or config-driven input.
-    """
-    subprocess.Popen(cmd, shell=True, start_new_session=True)
+    """Run a shell command detached. Only call with trusted, hardcoded commands."""
+    subprocess.Popen(["bash", "-c", cmd], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _resume_session(session_id: str) -> None:
@@ -321,6 +321,7 @@ class ControlPanel(Gtk.Window):
         self._build_settings_tab()
         self._build_hooks_tab()
         self._build_monitor_tab()
+        self._build_cost_tab()
         self.notebook.append_page(build_logs_tab(), Gtk.Label(label="Logs"))
         self.notebook.append_page(build_sessions_tab(), Gtk.Label(label="Sessions"))
         self.notebook.append_page(build_processes_tab(), Gtk.Label(label="Prozesse"))
@@ -355,6 +356,7 @@ class ControlPanel(Gtk.Window):
         GLib.timeout_add_seconds(10, refresh_logs)
         GLib.timeout_add_seconds(60, refresh_sessions)
         GLib.timeout_add_seconds(30, refresh_processes)
+        GLib.timeout_add_seconds(30, self._refresh_cost)
 
     def _start_monitor_timer(self) -> bool:
         """One-shot: starts the 30s monitor timer (offset from hub by 15s)."""
@@ -407,13 +409,15 @@ class ControlPanel(Gtk.Window):
 
         vbox.pack_start(stats_box, False, False, 0)
 
-        # --- Provider Cost Breakdown ---
-        provider_label = Gtk.Label(label="Kosten nach Provider", xalign=0)
-        provider_label.get_style_context().add_class("section-title")
-        vbox.pack_start(provider_label, False, False, 8)
-
+        # --- Provider Cost Breakdown (in Frame for visibility) ---
+        provider_frame = Gtk.Frame(label="  Kosten nach Provider  ")
         self.provider_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        vbox.pack_start(self.provider_box, False, False, 0)
+        self.provider_box.set_margin_top(8)
+        self.provider_box.set_margin_bottom(8)
+        self.provider_box.set_margin_start(10)
+        self.provider_box.set_margin_end(10)
+        provider_frame.add(self.provider_box)
+        vbox.pack_start(provider_frame, False, False, 4)
 
         # Pre-create 4 provider rows (anthropic, minimax, codex, gemini)
         self._provider_slots = {}
@@ -453,6 +457,38 @@ class ControlPanel(Gtk.Window):
                 "cost": cost_lbl,
                 "color": color,
             }
+
+        # --- Diagrams (compact chip-style FlowBox) ---
+        diagrams_label = Gtk.Label(label="Diagramme", xalign=0)
+        diagrams_label.get_style_context().add_class("section-title")
+        vbox.pack_start(diagrams_label, False, False, 4)
+
+        diagrams_flow = Gtk.FlowBox()
+        diagrams_flow.set_max_children_per_line(5)
+        diagrams_flow.set_min_children_per_line(3)
+        diagrams_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        diagrams_flow.set_homogeneous(False)
+        diagrams_flow.set_row_spacing(4)
+        diagrams_flow.set_column_spacing(6)
+
+        _DIAGRAMS = [
+            ("Lifecycle", "claude-session-lifecycle.html"),
+            ("Delegation", "claude-delegation-architecture.html"),
+            ("Skills", "claude-skill-ecosystem.html"),
+            ("Kosten", "claude-cost-dashboard.html"),
+            ("Oktopus", "oktopus-visual.html"),
+        ]
+        _DIAGRAMS_DIR = str(Path.home() / ".agent" / "diagrams")
+        for label, filename in _DIAGRAMS:
+            btn = Gtk.Button(label=label)
+            btn.get_style_context().add_class("shortcut-btn")
+            btn.get_style_context().add_class("shortcut-docs")
+            filepath = f"{_DIAGRAMS_DIR}/{filename}"
+            btn.connect("clicked", lambda _, p=filepath: _open_path(p))
+            btn.set_tooltip_text(filename)
+            diagrams_flow.add(btn)
+
+        vbox.pack_start(diagrams_flow, False, False, 0)
 
         # --- Recent Sessions (pre-created fixed rows) ---
         sessions_label = Gtk.Label(label="Letzte Sessions", xalign=0)
@@ -541,7 +577,18 @@ class ControlPanel(Gtk.Window):
             btn.get_style_context().add_class("shortcut-btn")
             category = sc.get("category", "folder")
             btn.get_style_context().add_class(f"shortcut-{category}")
-            btn.set_tooltip_text(sc["tooltip"])
+
+            # Check path existence for non-command shortcuts and dim if missing
+            if "command" not in sc:
+                resolved_path = Path(sc["path"]).expanduser()
+                if not resolved_path.exists():
+                    btn.set_sensitive(False)
+                    btn.set_opacity(0.4)
+                    btn.set_tooltip_text(f"{sc['tooltip']}  [Pfad nicht gefunden: {sc['path']}]")
+                else:
+                    btn.set_tooltip_text(sc["tooltip"])
+            else:
+                btn.set_tooltip_text(sc["tooltip"])
 
             # Connect click handler
             if "command" in sc:
@@ -643,83 +690,85 @@ class ControlPanel(Gtk.Window):
 
     def _refresh_hub(self) -> bool:
         """Refresh hub tab data. Updates fixed labels — no widget rebuild."""
-        # Quick stats
-        cost_data = get_daily_cost()
-        if "error" not in cost_data:
-            self.hub_cost_label.set_text(format_cost(cost_data["cost_estimate_usd"]))
-            self.hub_calls_label.set_text(str(cost_data["total_calls"]))
-        else:
-            self.hub_cost_label.set_text("N/A")
-            self.hub_calls_label.set_text("N/A")
-
-        active = get_active_sessions()
-        self.hub_sessions_label.set_text(str(len(active)))
-
-        # Provider cost breakdown
-        provider_costs = get_provider_costs()
-        total_provider = sum(provider_costs.values()) or 0.001  # avoid div by zero
-
-        for provider_name, slot in self._provider_slots.items():
-            cost = provider_costs.get(provider_name, 0.0)
-            if cost > 0:
-                pct = cost / total_provider * 100
-                bar_len = max(1, int(pct / 100 * 30))
-                bar_text = "\u2588" * bar_len
-                color = slot["color"]
-                slot["bar"].set_markup(f'<span foreground="{color}">{bar_text}</span>')
-                slot["cost"].set_text(f"${cost:.4f} ({pct:.0f}%)")
-                slot["row"].show_all()
+        try:
+            # Quick stats
+            cost_data = get_daily_cost()
+            if "error" not in cost_data:
+                self.hub_cost_label.set_text(format_cost(cost_data["cost_estimate_usd"]))
+                self.hub_calls_label.set_text(str(cost_data["total_calls"]))
             else:
-                slot["row"].hide()
+                self.hub_cost_label.set_text("N/A")
+                self.hub_calls_label.set_text("N/A")
 
-        # Recent sessions — update fixed slots
-        sessions = get_recent_sessions(_MAX_SESSION_ROWS)
-        for i, slot in enumerate(self._session_slots):
-            if i < len(sessions):
-                s = sessions[i]
-                slot["project"].set_text(s["project"])
-                slot["preview"].set_text(s["preview"])
-                slot["time"].set_text(s["time_str"])
+            active = get_active_sessions()
+            self.hub_sessions_label.set_text(str(len(active)))
 
-                # Reconnect resume button to new session ID
-                if slot["_handler_id"] is not None:
-                    slot["resume"].disconnect(slot["_handler_id"])
-                slot["_handler_id"] = slot["resume"].connect(
-                    "clicked",
-                    lambda _, sid=s["session_id"]: _resume_session(sid),
-                )
-                slot["row"].show_all()
+            # Provider cost breakdown
+            provider_costs = get_provider_costs()
+            total_provider = sum(provider_costs.values()) or 0.001  # avoid div by zero
+
+            for provider_name, slot in self._provider_slots.items():
+                cost = provider_costs.get(provider_name, 0.0)
+                if cost > 0:
+                    pct = cost / total_provider * 100
+                    bar_len = max(1, int(pct / 100 * 30))
+                    bar_text = "\u2588" * bar_len
+                    color = slot["color"]
+                    slot["bar"].set_markup(f'<span foreground="{color}">{bar_text}</span>')
+                    slot["cost"].set_text(f"${cost:.4f} ({pct:.0f}%)")
+                    slot["row"].show_all()
+                else:
+                    slot["row"].hide()
+
+            # Recent sessions — update fixed slots
+            sessions = get_recent_sessions(_MAX_SESSION_ROWS)
+            for i, slot in enumerate(self._session_slots):
+                if i < len(sessions):
+                    s = sessions[i]
+                    slot["project"].set_text(s["project"])
+                    slot["preview"].set_text(s["preview"])
+                    slot["time"].set_text(s["time_str"])
+
+                    # Reconnect resume button to new session ID
+                    if slot["_handler_id"] is not None:
+                        slot["resume"].disconnect(slot["_handler_id"])
+                    slot["_handler_id"] = slot["resume"].connect(
+                        "clicked",
+                        lambda _, sid=s["session_id"]: _resume_session(sid),
+                    )
+                    slot["row"].show_all()
+                else:
+                    slot["row"].hide()
+
+            if sessions:
+                self._no_sessions_label.hide()
             else:
-                slot["row"].hide()
+                self._no_sessions_label.show()
 
-        if sessions:
-            self._no_sessions_label.hide()
-        else:
-            self._no_sessions_label.show()
+            # Usage timeline — update fixed slots
+            timeline = get_usage_timeline()
+            max_calls = max((t["calls"] for t in timeline), default=1) or 1
 
-        # Usage timeline — update fixed slots
-        timeline = get_usage_timeline()
-        max_calls = max((t["calls"] for t in timeline), default=1) or 1
+            for i, slot in enumerate(self._timeline_slots):
+                if i < len(timeline):
+                    t = timeline[i]
+                    slot["date"].set_text(t["date"])
+                    bar_len = int((t["calls"] / max_calls) * 30)
+                    slot["bar"].set_text("\u2588" * bar_len)
+                    slot["count"].set_text(f"{t['calls']} calls")
+                    slot["row"].show_all()
+                else:
+                    slot["row"].hide()
 
-        for i, slot in enumerate(self._timeline_slots):
-            if i < len(timeline):
-                t = timeline[i]
-                slot["date"].set_text(t["date"])
-                bar_len = int((t["calls"] / max_calls) * 30)
-                slot["bar"].set_text("\u2588" * bar_len)
-                slot["count"].set_text(f"{t['calls']} calls")
-                slot["row"].show_all()
+            # Missed skills in hub
+            missed = get_missed_skills_summary()
+            if missed:
+                lines = [f"  {skill}: {count}x verpasst" for skill, count in missed[:5]]
+                self.hub_missed_label.set_text("\n".join(lines))
             else:
-                slot["row"].hide()
-
-        # Missed skills in hub
-        missed = get_missed_skills_summary()
-        if missed:
-            lines = [f"  {skill}: {count}x verpasst" for skill, count in missed[:5]]
-            self.hub_missed_label.set_text("\n".join(lines))
-        else:
-            self.hub_missed_label.set_text("Keine verpassten Skills heute")
-
+                self.hub_missed_label.set_text("Keine verpassten Skills heute")
+        except Exception:
+            pass  # keep timer alive
         return True  # keep 30s timer alive
 
     # -----------------------------------------------------------------------
@@ -1083,41 +1132,229 @@ class ControlPanel(Gtk.Window):
 
     def _refresh_monitor(self) -> bool:
         """Refresh monitor tab data only. Does NOT call _refresh_hub."""
-        # Cost
-        cost_data = get_daily_cost()
-        if "error" not in cost_data:
-            self.cost_label.set_text(
-                f"{format_cost(cost_data['cost_estimate_usd'])}  "
-                f"({cost_data['total_calls']} Calls, {cost_data['unique_tools']} Tools)"
-            )
-        else:
-            self.cost_label.set_text(cost_data.get("error", "N/A"))
+        try:
+            # Cost
+            cost_data = get_daily_cost()
+            if "error" not in cost_data:
+                self.cost_label.set_text(
+                    f"{format_cost(cost_data['cost_estimate_usd'])}  "
+                    f"({cost_data['total_calls']} Calls, {cost_data['unique_tools']} Tools)"
+                )
+            else:
+                self.cost_label.set_text(cost_data.get("error", "N/A"))
 
-        # Sessions
-        sessions = get_active_sessions()
-        if sessions:
-            lines = [f"  {s['project']}  ({s['age_min']}min)" for s in sessions[:6]]
-            self.monitor_sessions_label.set_text("\n".join(lines))
-        else:
-            self.monitor_sessions_label.set_text("Keine aktiven Sessions")
+            # Sessions
+            sessions = get_active_sessions()
+            if sessions:
+                lines = [f"  {s['project']}  ({s['age_min']}min)" for s in sessions[:6]]
+                self.monitor_sessions_label.set_text("\n".join(lines))
+            else:
+                self.monitor_sessions_label.set_text("Keine aktiven Sessions")
 
-        # Top Tools
-        tools = get_top_tools(5)
-        if tools:
-            lines = [f"  {name}: {count}x" for name, count in tools]
-            self.tools_label.set_text("\n".join(lines))
-        else:
-            self.tools_label.set_text("Keine Daten")
+            # Top Tools
+            tools = get_top_tools(5)
+            if tools:
+                lines = [f"  {name}: {count}x" for name, count in tools]
+                self.tools_label.set_text("\n".join(lines))
+            else:
+                self.tools_label.set_text("Keine Daten")
 
-        # Missed Skills
-        missed = get_missed_skills_summary()
-        if missed:
-            lines = [f"  {skill}: {count}x" for skill, count in missed]
-            self.skills_label.set_text("\n".join(lines))
-        else:
-            self.skills_label.set_text("Keine verpassten Skills heute")
-
+            # Missed Skills
+            missed = get_missed_skills_summary()
+            if missed:
+                lines = [f"  {skill}: {count}x" for skill, count in missed]
+                self.skills_label.set_text("\n".join(lines))
+            else:
+                self.skills_label.set_text("Keine verpassten Skills heute")
+        except Exception:
+            pass  # keep timer alive
         return True  # keep 30s timer alive
+
+    # -----------------------------------------------------------------------
+    # Tab 5: Cost — Provider breakdown + usage timeline
+    # -----------------------------------------------------------------------
+    def _build_cost_tab(self):
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_margin_top(16)
+        vbox.set_margin_bottom(16)
+        vbox.set_margin_start(16)
+        vbox.set_margin_end(16)
+
+        # --- Total Daily Cost (big) ---
+        self.cost_total_label = Gtk.Label(label="...")
+        self.cost_total_label.get_style_context().add_class("cost-value")
+        total_sub = Gtk.Label(label="Heutige Gesamtkosten")
+        total_sub.get_style_context().add_class("stat-label")
+        total_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        total_box.set_halign(Gtk.Align.CENTER)
+        total_box.pack_start(self.cost_total_label, False, False, 0)
+        total_box.pack_start(total_sub, False, False, 0)
+        vbox.pack_start(total_box, False, False, 8)
+
+        # --- Provider Breakdown ---
+        provider_frame = Gtk.Frame(label="  Provider-Breakdown  ")
+        provider_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        provider_inner.set_margin_top(10)
+        provider_inner.set_margin_bottom(10)
+        provider_inner.set_margin_start(12)
+        provider_inner.set_margin_end(12)
+
+        self._cost_provider_slots = {}
+        provider_meta = [
+            ("anthropic", "#89b4fa", "Claude (Opus/Sonnet/Haiku)"),
+            ("minimax", "#a6e3a1", "MiniMax M2.5 (~$0.05/1M)"),
+            ("codex", "#fab387", "Codex/OpenCode (~$0.10/1M)"),
+            ("gemini", "#f9e2af", "Gemini Flash (~$0.10/1M)"),
+        ]
+        for name, color, desc in provider_meta:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+            name_lbl = Gtk.Label(xalign=0)
+            name_lbl.set_markup(f'<span foreground="{color}"><b>{name.capitalize()}</b></span>')
+            name_lbl.set_width_chars(12)
+            row.pack_start(name_lbl, False, False, 0)
+
+            bar_lbl = Gtk.Label(label="")
+            bar_lbl.set_xalign(0)
+            row.pack_start(bar_lbl, True, True, 0)
+
+            cost_lbl = Gtk.Label(label="—", xalign=1)
+            cost_lbl.set_width_chars(16)
+            row.pack_start(cost_lbl, False, False, 0)
+
+            desc_lbl = Gtk.Label(label=desc)
+            desc_lbl.set_opacity(0.5)
+            desc_lbl.set_xalign(0)
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            box.pack_start(row, False, False, 0)
+            box.pack_start(desc_lbl, False, False, 0)
+
+            provider_inner.pack_start(box, False, False, 0)
+            self._cost_provider_slots[name] = {
+                "bar": bar_lbl,
+                "cost": cost_lbl,
+                "color": color,
+            }
+
+        provider_frame.add(provider_inner)
+        vbox.pack_start(provider_frame, False, False, 0)
+
+        # --- Calls + Tools Summary ---
+        stats_frame = Gtk.Frame(label="  Heutige Nutzung  ")
+        stats_inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        stats_inner.set_halign(Gtk.Align.CENTER)
+        stats_inner.set_margin_top(10)
+        stats_inner.set_margin_bottom(10)
+
+        self.cost_calls_label = Gtk.Label(label="...")
+        self.cost_calls_label.get_style_context().add_class("stat-value")
+        calls_sub = Gtk.Label(label="Tool Calls")
+        calls_sub.get_style_context().add_class("stat-label")
+        col1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        col1.pack_start(self.cost_calls_label, False, False, 0)
+        col1.pack_start(calls_sub, False, False, 0)
+        stats_inner.pack_start(col1, True, True, 0)
+
+        self.cost_tools_label = Gtk.Label(label="...")
+        self.cost_tools_label.get_style_context().add_class("stat-value")
+        tools_sub = Gtk.Label(label="Unique Tools")
+        tools_sub.get_style_context().add_class("stat-label")
+        col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        col2.pack_start(self.cost_tools_label, False, False, 0)
+        col2.pack_start(tools_sub, False, False, 0)
+        stats_inner.pack_start(col2, True, True, 0)
+
+        stats_frame.add(stats_inner)
+        vbox.pack_start(stats_frame, False, False, 0)
+
+        # --- 7-Day Timeline ---
+        timeline_frame = Gtk.Frame(label="  Letzte 7 Tage  ")
+        self.cost_timeline_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.cost_timeline_box.set_margin_top(8)
+        self.cost_timeline_box.set_margin_bottom(8)
+        self.cost_timeline_box.set_margin_start(10)
+        self.cost_timeline_box.set_margin_end(10)
+
+        self._cost_timeline_slots = []
+        for _ in range(7):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            date_lbl = Gtk.Label(label="", xalign=0)
+            date_lbl.set_width_chars(12)
+            row.pack_start(date_lbl, False, False, 0)
+
+            bar_lbl = Gtk.Label(label="")
+            bar_lbl.get_style_context().add_class("monitor-value")
+            bar_lbl.set_xalign(0)
+            row.pack_start(bar_lbl, True, True, 0)
+
+            info_lbl = Gtk.Label(label="", xalign=1)
+            info_lbl.set_width_chars(18)
+            info_lbl.set_opacity(0.6)
+            row.pack_start(info_lbl, False, False, 0)
+
+            self.cost_timeline_box.pack_start(row, False, False, 0)
+            row.set_no_show_all(True)
+            self._cost_timeline_slots.append({
+                "row": row, "date": date_lbl, "bar": bar_lbl, "info": info_lbl,
+            })
+
+        timeline_frame.add(self.cost_timeline_box)
+        vbox.pack_start(timeline_frame, False, False, 0)
+
+        scrolled.add(vbox)
+        self.notebook.append_page(scrolled, Gtk.Label(label="Cost"))
+
+        idle_once(self._refresh_cost)
+
+    def _refresh_cost(self) -> bool:
+        """Refresh cost tab data."""
+        try:
+            cost_data = get_daily_cost()
+            if "error" not in cost_data:
+                self.cost_total_label.set_text(format_cost(cost_data["cost_estimate_usd"]))
+                self.cost_calls_label.set_text(str(cost_data["total_calls"]))
+                self.cost_tools_label.set_text(str(cost_data.get("unique_tools", "?")))
+            else:
+                self.cost_total_label.set_text("N/A")
+
+            # Provider breakdown
+            provider_costs = get_provider_costs()
+            total_p = sum(provider_costs.values()) or 0.001
+            for name, slot in self._cost_provider_slots.items():
+                cost = provider_costs.get(name, 0.0)
+                if cost > 0:
+                    pct = cost / total_p * 100
+                    bar_len = max(1, int(pct / 100 * 25))
+                    slot["bar"].set_markup(
+                        f'<span foreground="{slot["color"]}">{"\u2588" * bar_len}</span>'
+                    )
+                    slot["cost"].set_text(f"${cost:.4f} ({pct:.0f}%)")
+                else:
+                    slot["bar"].set_text("")
+                    slot["cost"].set_text("—")
+
+            # Timeline
+            timeline = get_usage_timeline()
+            max_calls = max((t["calls"] for t in timeline), default=1) or 1
+            for i, slot in enumerate(self._cost_timeline_slots):
+                if i < len(timeline):
+                    t = timeline[i]
+                    slot["date"].set_text(t["date"])
+                    bar_len = int((t["calls"] / max_calls) * 25)
+                    slot["bar"].set_markup(
+                        f'<span foreground="#89b4fa">{"\u2588" * bar_len}</span>'
+                    )
+                    slot["info"].set_text(f'{t["calls"]} calls  ~${t["cost_est"]:.3f}')
+                    slot["row"].show_all()
+                else:
+                    slot["row"].hide()
+        except Exception:
+            pass
+        return True
 
     # -----------------------------------------------------------------------
     # Save / Reset
@@ -1250,11 +1487,13 @@ class ControlPanel(Gtk.Window):
         if current in models:
             self.model_combo.set_active(models.index(current))
 
-        # Autonomy
+        # Autonomy — items are capitalized, map via lowercase index
         autonomy_modes = ["balanced", "sprint", "conserve"]
         current_auto = env.get("CLAUDE_AUTONOMY_MODE", "balanced").lower()
         if current_auto in autonomy_modes:
             self.autonomy_combo.set_active(autonomy_modes.index(current_auto))
+        else:
+            self.autonomy_combo.set_active(0)  # fallback to "Balanced"
 
         # Max Subagents
         self.subagents_adj.set_value(int(env.get("CLAUDE_MAX_SUBAGENTS", "8")))
