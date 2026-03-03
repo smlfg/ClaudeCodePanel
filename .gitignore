@@ -4,3 +4,5 @@ __pycache__/
 *.bak
 .venv/
 venv/
+CLAUDE.md
+REVIEW_*.md
