@@ -29,12 +29,14 @@ from monitor import (
     get_recent_sessions,
     get_missed_skills_summary,
     get_usage_timeline,
+    get_provider_costs,
     format_cost,
 )
 from log_viewer import build_logs_tab, refresh_logs
 from session_browser import build_sessions_tab, refresh_sessions
 from process_manager import build_processes_tab, refresh_processes
 from theme import build_css, setup_theme_watcher
+from utils import idle_once
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +83,6 @@ SHORTCUTS = [
         "icon": "emblem-synchronizing",
         "path": "~/.agent/diagrams/claude-session-lifecycle.html",
         "tooltip": "Session Lifecycle — Phasen, Hooks, Checkpoints",
-        "command": "xdg-open file:///home/smlflg/.agent/diagrams/claude-session-lifecycle.html",
         "category": "service",
     },
     {
@@ -89,7 +90,6 @@ SHORTCUTS = [
         "icon": "emblem-shared",
         "path": "~/.agent/diagrams/claude-delegation-architecture.html",
         "tooltip": "Delegation Architecture — Opus→Sonnet→Haiku→Gemini",
-        "command": "xdg-open file:///home/smlflg/.agent/diagrams/claude-delegation-architecture.html",
         "category": "service",
     },
     {
@@ -97,7 +97,6 @@ SHORTCUTS = [
         "icon": "emblem-package",
         "path": "~/.agent/diagrams/claude-skill-ecosystem.html",
         "tooltip": "Skill Ecosystem — Alle Skills + Trigger + Kosten",
-        "command": "xdg-open file:///home/smlflg/.agent/diagrams/claude-skill-ecosystem.html",
         "category": "service",
     },
     {
@@ -105,7 +104,6 @@ SHORTCUTS = [
         "icon": "emblem-money",
         "path": "~/.agent/diagrams/claude-cost-dashboard.html",
         "tooltip": "Cost Dashboard — Kosten-Analyse + Optimierung",
-        "command": "xdg-open file:///home/smlflg/.agent/diagrams/claude-cost-dashboard.html",
         "category": "service",
     },
     # --- Docs (Yellow #f9e2af) — reference, guides, knowledge ---
@@ -274,7 +272,11 @@ def _open_path(path: str) -> None:
 
 
 def _run_command(cmd: str) -> None:
-    """Run a shell command in background."""
+    """Run a shell command in background.
+
+    WARNING: Uses shell=True — only call with trusted, hardcoded commands
+    from the SHORTCUTS list. NEVER pass user-provided or config-driven input.
+    """
     subprocess.Popen(cmd, shell=True, start_new_session=True)
 
 
@@ -404,6 +406,53 @@ class ControlPanel(Gtk.Window):
             stats_box.pack_start(col, True, True, 0)
 
         vbox.pack_start(stats_box, False, False, 0)
+
+        # --- Provider Cost Breakdown ---
+        provider_label = Gtk.Label(label="Kosten nach Provider", xalign=0)
+        provider_label.get_style_context().add_class("section-title")
+        vbox.pack_start(provider_label, False, False, 8)
+
+        self.provider_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vbox.pack_start(self.provider_box, False, False, 0)
+
+        # Pre-create 4 provider rows (anthropic, minimax, codex, gemini)
+        self._provider_slots = {}
+        provider_colors = {
+            "anthropic": "#89b4fa",  # blue
+            "minimax": "#a6e3a1",    # green
+            "codex": "#fab387",      # peach/orange
+            "gemini": "#f9e2af",     # yellow
+        }
+        for provider_name in ["anthropic", "minimax", "codex", "gemini"]:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.set_margin_start(8)
+
+            name_lbl = Gtk.Label(label=provider_name.capitalize(), xalign=0)
+            name_lbl.set_width_chars(12)
+            row.pack_start(name_lbl, False, False, 0)
+
+            # Color bar (using a Label with block characters)
+            bar_lbl = Gtk.Label(label="")
+            bar_lbl.set_xalign(0)
+            color = provider_colors.get(provider_name, "#cdd6f4")
+            bar_lbl.set_markup(f'<span foreground="{color}"></span>')
+            row.pack_start(bar_lbl, True, True, 0)
+
+            cost_lbl = Gtk.Label(label="$0.00", xalign=1)
+            cost_lbl.set_width_chars(12)
+            cost_lbl.set_opacity(0.7)
+            row.pack_start(cost_lbl, False, False, 0)
+
+            self.provider_box.pack_start(row, False, False, 0)
+            row.set_no_show_all(True)
+
+            self._provider_slots[provider_name] = {
+                "row": row,
+                "name": name_lbl,
+                "bar": bar_lbl,
+                "cost": cost_lbl,
+                "color": color,
+            }
 
         # --- Recent Sessions (pre-created fixed rows) ---
         sessions_label = Gtk.Label(label="Letzte Sessions", xalign=0)
@@ -590,8 +639,7 @@ class ControlPanel(Gtk.Window):
         scrolled.add(vbox)
         self.notebook.append_page(scrolled, Gtk.Label(label="Hub"))
 
-        # Initial population via idle (non-blocking)
-        GLib.idle_add(self._refresh_hub)
+        idle_once(self._refresh_hub)
 
     def _refresh_hub(self) -> bool:
         """Refresh hub tab data. Updates fixed labels — no widget rebuild."""
@@ -606,6 +654,23 @@ class ControlPanel(Gtk.Window):
 
         active = get_active_sessions()
         self.hub_sessions_label.set_text(str(len(active)))
+
+        # Provider cost breakdown
+        provider_costs = get_provider_costs()
+        total_provider = sum(provider_costs.values()) or 0.001  # avoid div by zero
+
+        for provider_name, slot in self._provider_slots.items():
+            cost = provider_costs.get(provider_name, 0.0)
+            if cost > 0:
+                pct = cost / total_provider * 100
+                bar_len = max(1, int(pct / 100 * 30))
+                bar_text = "\u2588" * bar_len
+                color = slot["color"]
+                slot["bar"].set_markup(f'<span foreground="{color}">{bar_text}</span>')
+                slot["cost"].set_text(f"${cost:.4f} ({pct:.0f}%)")
+                slot["row"].show_all()
+            else:
+                slot["row"].hide()
 
         # Recent sessions — update fixed slots
         sessions = get_recent_sessions(_MAX_SESSION_ROWS)
@@ -1014,8 +1079,7 @@ class ControlPanel(Gtk.Window):
         scrolled.add(vbox)
         self.notebook.append_page(scrolled, Gtk.Label(label="Monitor"))
 
-        # Initial refresh via idle (non-blocking)
-        GLib.idle_add(self._refresh_monitor)
+        idle_once(self._refresh_monitor)
 
     def _refresh_monitor(self) -> bool:
         """Refresh monitor tab data only. Does NOT call _refresh_hub."""
@@ -1110,12 +1174,22 @@ class ControlPanel(Gtk.Window):
             else:
                 settings.pop("statusLine", None)
 
-            # MCP Server toggles — remove disabled servers from config
-            # (store originals so we can re-add them)
-            original_mcps = settings.get("mcpServers", {})
-            for name, sw in self.mcp_switches.items():
-                if not sw.get_active() and name in original_mcps:
-                    del settings["mcpServers"][name]
+            # MCP Server toggles — store disabled servers separately, never delete
+            if "mcpServers" in settings:
+                if "_disabled" not in settings:
+                    settings["_disabled"] = {}
+                for name, sw in self.mcp_switches.items():
+                    if not sw.get_active():
+                        # Move to _disabled (preserve config for re-enable)
+                        if name in settings["mcpServers"]:
+                            settings["_disabled"][name] = settings["mcpServers"].pop(name)
+                    else:
+                        # Re-enable: move back from _disabled if it was there
+                        if name in settings.get("_disabled", {}):
+                            settings["mcpServers"][name] = settings["_disabled"].pop(name)
+                # Clean up empty _disabled
+                if not settings["_disabled"]:
+                    del settings["_disabled"]
 
             # Hook timeouts and async flags
             for hw in self.hook_widgets:
@@ -1166,8 +1240,9 @@ class ControlPanel(Gtk.Window):
             self._set_status(f"Fehler: {e}", "status-error")
 
     def on_reset(self, _button):
-        """Reload settings from disk."""
+        """Reload settings from disk and reset ALL UI widgets."""
         self.settings = read_settings()
+        env = self.settings.get("env", {})
 
         # Model
         models = ["opus", "sonnet", "haiku"]
@@ -1175,17 +1250,37 @@ class ControlPanel(Gtk.Window):
         if current in models:
             self.model_combo.set_active(models.index(current))
 
+        # Autonomy
+        autonomy_modes = ["balanced", "sprint", "conserve"]
+        current_auto = env.get("CLAUDE_AUTONOMY_MODE", "balanced").lower()
+        if current_auto in autonomy_modes:
+            self.autonomy_combo.set_active(autonomy_modes.index(current_auto))
+
+        # Max Subagents
+        self.subagents_adj.set_value(int(env.get("CLAUDE_MAX_SUBAGENTS", "8")))
+
         # Budget
-        budget = int(
-            self.settings.get("env", {}).get("SLASH_COMMAND_TOOL_CHAR_BUDGET", "10000")
-        )
-        self.budget_adj.set_value(budget)
+        self.budget_adj.set_value(int(env.get("SLASH_COMMAND_TOOL_CHAR_BUDGET", "10000")))
 
         # Teams
-        teams = self.settings.get("env", {}).get(
-            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "0"
-        )
-        self.teams_switch.set_active(teams == "1")
+        self.teams_switch.set_active(env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "0") == "1")
+
+        # Tool Search
+        ts_options = ["auto:5", "auto:10", "manual", "off"]
+        current_ts = env.get("ENABLE_TOOL_SEARCH", "auto:5")
+        if current_ts in ts_options:
+            self.tool_search_combo.set_active(ts_options.index(current_ts))
+
+        # Project MCP
+        self.project_mcp_switch.set_active(self.settings.get("enableAllProjectMcpServers", False))
+
+        # Status Line
+        self.statusline_switch.set_active("statusLine" in self.settings)
+
+        # MCP Switches — all active (config = enabled)
+        mcp_servers = self.settings.get("mcpServers", {})
+        for name, sw in self.mcp_switches.items():
+            sw.set_active(name in mcp_servers)
 
         # Coaching
         rate = read_coaching_rate_limit()

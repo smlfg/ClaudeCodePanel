@@ -17,6 +17,7 @@ import signal
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 
 import gi
 
@@ -27,8 +28,8 @@ from gi.repository import GLib, Gtk, Pango
 # Constants
 # ---------------------------------------------------------------------------
 
-# Colors from theme.py palette (adapts to light/dark)
 from theme import get_palette, hex_to_pango_rgb
+from utils import idle_once, short_name_from_path, HOME, CLK_TCK
 
 GHOST_HOURS = 24  # processes older than this are "ghosts"
 
@@ -86,6 +87,7 @@ def _scan_processes() -> list[dict]:
                 pid = int(parts[1])
                 cpu = float(parts[2])
                 rss_kb = int(parts[5])
+                tty = parts[6]         # e.g. "pts/33" or "?"
                 start_str = parts[8]   # e.g. "10:30" or "Feb12"
                 time_str = parts[9]    # cumulative CPU time e.g. "0:00"
                 command = parts[10]
@@ -107,7 +109,7 @@ def _scan_processes() -> list[dict]:
                 continue
 
             # Derive display name from command
-            name = _derive_name(command, matched_keyword)
+            name = _derive_name(command, matched_keyword, pid)
 
             # RAM in MB
             ram_mb = rss_kb / 1024
@@ -123,6 +125,7 @@ def _scan_processes() -> list[dict]:
                 "command": command[:80],
                 "cpu": cpu,
                 "ram_mb": ram_mb,
+                "tty": tty if tty != "?" else "",
                 "start_str": start_str,
                 "uptime_h": uptime_h,
                 "is_ghost": is_ghost,
@@ -136,18 +139,51 @@ def _scan_processes() -> list[dict]:
     return processes
 
 
-def _derive_name(command: str, keyword: str) -> str:
-    """Derive a short display name from the full command string."""
-    # Extract the executable basename from the command
+_FRIENDLY_NAMES = {
+    "opencode-mcp": "OpenCode MCP",
+    "opencode": "OpenCode Server",
+    "gemini-mcp": "Gemini MCP",
+    "server-filesystem": "Filesystem MCP",
+    "server-memory": "Memory MCP",
+    "server-github": "GitHub MCP",
+    "codex": "Codex CLI",
+    "mcp-server": "MCP Server",
+}
+
+
+def _get_cwd_project(pid: int) -> str:
+    """Try to read the CWD of a process and extract a project name."""
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+        name = short_name_from_path(cwd)
+        return "" if name == "Home" else name
+    except OSError:
+        return ""
+
+
+def _derive_name(command: str, keyword: str, pid: int = 0) -> str:
+    """Derive a friendly display name from the full command string."""
+    # Special handling for claude CLI — try to show project context
+    if keyword == "claude":
+        # Check if resumed session (-r flag)
+        resumed = " -r" in command or "\x00-r" in command
+        project = _get_cwd_project(pid) if pid else ""
+        if project:
+            return f"Claude CLI — {project}"
+        return "Claude CLI (resumed)" if resumed else "Claude CLI"
+
+    # Check friendly name table (normalize mcp- prefix for lookup)
+    lookup = keyword.removeprefix("mcp-") if keyword not in _FRIENDLY_NAMES else keyword
+    if lookup in _FRIENDLY_NAMES:
+        return _FRIENDLY_NAMES[lookup]
+
+    # Fallback: executable basename
     parts = command.split()
     if not parts:
         return keyword
 
-    exe = parts[0]
-    # Get basename
-    exe_base = exe.split("/")[-1]
+    exe_base = Path(parts[0]).name
 
-    # Map common names to friendlier labels
     name_map = {
         "node": f"node/{keyword}",
         "python3": f"python/{keyword}",
@@ -167,7 +203,7 @@ def _get_uptime_hours(pid: int, now: float) -> float:
             stat_data = f.read().split()
         # Field 22 (index 21) is starttime in clock ticks since boot
         starttime_ticks = int(stat_data[21])
-        clk_tck = os.sysconf("SC_CLK_TCK")
+        clk_tck = CLK_TCK
 
         with open("/proc/uptime") as f:
             boot_seconds_ago = float(f.read().split()[0])
@@ -336,7 +372,10 @@ def _build_process_row(proc: dict, parent_widget: Gtk.Widget) -> Gtk.ListBoxRow:
     pid_box.set_valign(Gtk.Align.CENTER)
     outer.pack_start(pid_box, False, False, 0)
 
-    pid_label = Gtk.Label(label=f"PID {proc['pid']}")
+    pid_text = f"PID {proc['pid']}"
+    if proc.get("tty"):
+        pid_text += f"  {proc['tty']}"
+    pid_label = Gtk.Label(label=pid_text)
     pid_label.get_style_context().add_class("stat-label")
     pid_attrs = Pango.AttrList()
     pid_attrs.insert(Pango.attr_scale_new(0.85))
@@ -385,7 +424,7 @@ def _build_process_row(proc: dict, parent_widget: Gtk.Widget) -> Gtk.ListBoxRow:
     def on_kill_clicked(_btn: Gtk.Button, _pid: int = pid, _name: str = name) -> None:
         if _confirm_kill(_btn, _pid, _name):
             _kill_process(_pid, _btn)
-            GLib.idle_add(refresh_processes)
+            idle_once(refresh_processes)
 
     kill_btn.connect("clicked", on_kill_clicked)
     meta_box.pack_start(kill_btn, False, False, 0)
@@ -490,7 +529,7 @@ def build_processes_tab() -> Gtk.ScrolledWindow:
         if _confirm_kill_ghosts(_btn, len(ghosts)):
             for p in ghosts:
                 _kill_process(p["pid"], _btn)
-            GLib.idle_add(refresh_processes)
+            idle_once(refresh_processes)
 
     kill_ghosts_btn.connect("clicked", on_kill_ghosts_clicked)
     toolbar.pack_start(kill_ghosts_btn, False, False, 0)
@@ -540,13 +579,7 @@ def build_processes_tab() -> Gtk.ScrolledWindow:
     _list_box.get_style_context().add_class("view")
     main_vbox.pack_start(_list_box, True, True, 0)
 
-    # Initial load (non-blocking)
-    def _initial_load() -> bool:
-        processes = _scan_processes()
-        _populate_list_box(processes)
-        return False  # run once
-
-    GLib.idle_add(_initial_load)
+    idle_once(lambda: _populate_list_box(_scan_processes()))
 
     scrolled.show_all()
     return scrolled

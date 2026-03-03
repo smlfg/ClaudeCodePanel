@@ -273,6 +273,56 @@ def get_usage_timeline() -> list[dict]:
     return timeline
 
 
+def get_provider_costs() -> dict[str, float]:
+    """Get today's cost breakdown by provider (cached 30s).
+
+    Reads ~/.claude/usage/providers.jsonl for provider-specific costs.
+    Returns: {"anthropic": 1.23, "minimax": 0.05, "codex": 0.12, "gemini": 0.01}
+    """
+    cached = _cache_get("provider_costs")
+    if cached is not None:
+        return cached
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    costs: dict[str, float] = {}
+
+    providers_file = USAGE_DIR / "providers.jsonl"
+    if providers_file.exists():
+        try:
+            with providers_file.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        entry_date = entry.get("time", "")[:10]
+                        if entry_date == today:
+                            provider = entry.get("provider", "unknown")
+                            cost = entry.get("cost_usd", 0.0)
+                            costs[provider] = costs.get(provider, 0.0) + cost
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except OSError:
+            pass
+
+    # Add Anthropic cost estimate from generic usage data
+    # (Tool calls not covered by specific providers are assumed Anthropic)
+    generic_cost = get_daily_cost()
+    if "error" not in generic_cost:
+        total_generic = generic_cost.get("cost_estimate_usd", 0.0)
+        provider_total = sum(costs.values())
+        anthropic_est = max(0.0, total_generic - provider_total)
+        if anthropic_est > 0:
+            costs["anthropic"] = round(anthropic_est, 6)
+
+    # Round all values
+    costs = {k: round(v, 6) for k, v in costs.items()}
+
+    _cache_set("provider_costs", costs)
+    return costs
+
+
 def format_cost(usd: float) -> str:
     """Format USD cost for display."""
     if usd < 0.01:

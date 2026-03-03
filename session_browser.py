@@ -23,10 +23,12 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk, Pango
 
+from utils import idle_once, short_name_from_path, HOME
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
+PROJECTS_DIR = Path(HOME) / ".claude" / "projects"
 MAX_SESSIONS = 20
 
 # Colors are handled by CSS classes defined in theme.py
@@ -53,36 +55,85 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
-def _get_preview(path: Path, max_len: int = 60) -> str:
-    """Read first user message from JSONL file."""
+_PREVIEW_SKIP_PREFIXES = (
+    "[Request interrupted",
+    "Implement the following plan",
+)
+
+
+def _get_session_meta(path: Path, max_len: int = 60) -> dict:
+    """Read metadata from JSONL file: preview text, cwd, slug.
+
+    Skips junk messages like '[Request interrupted by user for tool use]'
+    and 'Implement the following plan:'.  For plan messages, extracts the
+    plan title (the first '# ...' heading).  Falls back to the session slug.
+    """
+    slug: str = ""
+    cwd: str = ""
+    preview: str = ""
+    lines_read = 0
+    max_lines = 80  # scan deeper — real messages can be far down after compression
     try:
         with path.open(encoding="utf-8", errors="replace") as f:
             for line in f:
+                lines_read += 1
+                if lines_read > max_lines:
+                    break
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     entry = json.loads(line)
-                    if entry.get("type") == "user":
-                        msg = entry.get("message", {})
-                        content = msg.get("content", "")
-                        if isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    content = block.get("text", "")
+                    # Capture slug and cwd from any entry
+                    if not slug and entry.get("slug"):
+                        slug = entry["slug"]
+                    if not cwd and entry.get("cwd"):
+                        cwd = entry["cwd"]
+                    if preview:
+                        # Already found preview, but keep scanning for cwd/slug
+                        if cwd and slug:
+                            break
+                        continue
+                    if entry.get("type") != "user":
+                        continue
+                    msg = entry.get("message", {})
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                content = block.get("text", "")
+                                break
+                        else:
+                            content = str(content)
+                    if not isinstance(content, str):
+                        continue
+                    content = content.strip()
+                    # Skip junk messages
+                    if any(content.startswith(p) for p in _PREVIEW_SKIP_PREFIXES):
+                        # For plan messages, try to extract the title
+                        if content.startswith("Implement the following plan"):
+                            for plan_line in content.split("\n"):
+                                plan_line = plan_line.strip()
+                                if plan_line.startswith("# "):
+                                    title = plan_line[2:].strip()
+                                    if title.lower().startswith("plan:"):
+                                        title = title[5:].strip()
+                                    if len(title) > max_len:
+                                        title = title[:max_len] + "..."
+                                    preview = title
                                     break
-                            else:
-                                content = str(content)
-                        if isinstance(content, str):
-                            content = content.strip().split("\n")[0]
-                            if len(content) > max_len:
-                                content = content[:max_len] + "..."
-                            return content
+                        continue
+                    first_line = content.split("\n")[0]
+                    if len(first_line) > max_len:
+                        first_line = first_line[:max_len] + "..."
+                    preview = first_line
                 except json.JSONDecodeError:
                     continue
     except (OSError, PermissionError):
         pass
-    return "(keine Vorschau)"
+    if not preview:
+        preview = slug if slug else "(keine Vorschau)"
+    return {"preview": preview, "cwd": cwd, "slug": slug}
 
 
 def _scan_all_sessions() -> list[dict]:
@@ -98,21 +149,21 @@ def _scan_all_sessions() -> list[dict]:
         for f in project_dir.glob("*.jsonl"):
             try:
                 stat = f.stat()
-                preview = _get_preview(f)
-                raw_name = project_dir.name
-                # Normalise project name: strip common home prefix fragments
-                project_name = raw_name
-                _home_frag = "-home-" + Path.home().name
-                project_name = project_name.replace(_home_frag + "-", "~/")
-                project_name = project_name.replace(_home_frag, "~")
-                # Strip leading dashes left over
-                project_name = project_name.lstrip("-")
-                if not project_name or project_name in ("~", "~/"):
+                meta = _get_session_meta(f)
+                preview = meta["preview"]
+                session_cwd = meta["cwd"]
+                # Use real CWD for short name (preserves umlauts)
+                short_name = short_name_from_path(session_cwd)
+                # Build full project path from CWD for display
+                if session_cwd and session_cwd != HOME:
+                    project_name = session_cwd.replace(HOME, "~", 1)
+                else:
                     project_name = "Home"
                 sessions.append(
                     {
                         "path": str(f),
                         "project": project_name,
+                        "short_name": short_name,
                         "session_id": f.stem,
                         "mtime": stat.st_mtime,
                         "size": stat.st_size,
@@ -159,13 +210,13 @@ def _build_session_row(session: dict) -> Gtk.ListBoxRow:
     outer.set_margin_end(10)
     row.add(outer)
 
-    # Left: project name + preview stacked vertically
+    # Left: short name + preview + full path stacked vertically
     info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
     info_box.set_hexpand(True)
     outer.pack_start(info_box, True, True, 0)
 
-    # Project name — bold, dedicated class
-    name_label = Gtk.Label(label=session["project"])
+    # Short project name — bold, dedicated class
+    name_label = Gtk.Label(label=session["short_name"])
     name_label.set_halign(Gtk.Align.START)
     name_label.set_ellipsize(Pango.EllipsizeMode.END)
     name_label.set_max_width_chars(45)
@@ -179,6 +230,18 @@ def _build_session_row(session: dict) -> Gtk.ListBoxRow:
     preview_label.set_max_width_chars(60)
     preview_label.get_style_context().add_class("session-preview")
     info_box.pack_start(preview_label, False, False, 0)
+
+    # Full project path — dimmed, only if different from short_name
+    if session["project"] != session["short_name"]:
+        path_label = Gtk.Label(label=session["project"])
+        path_label.set_halign(Gtk.Align.START)
+        path_label.set_ellipsize(Pango.EllipsizeMode.END)
+        path_label.set_max_width_chars(60)
+        path_label.get_style_context().add_class("session-meta")
+        path_attrs = Pango.AttrList()
+        path_attrs.insert(Pango.attr_scale_new(0.82))
+        path_label.set_attributes(path_attrs)
+        info_box.pack_start(path_label, False, False, 0)
 
     # Right: meta info + resume button
     meta_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -215,10 +278,10 @@ def _on_resume_clicked(_btn: Gtk.Button, session_id: str) -> None:
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        # kitty not found — try fallback terminal
+        # kitty not found — try fallback terminal via shell
         try:
             subprocess.Popen(
-                ["x-terminal-emulator", "-e", f"claude -r {shlex.quote(session_id)}"],
+                ["x-terminal-emulator", "-e", "bash", "-c", f"claude -r {shlex.quote(session_id)}"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -241,7 +304,8 @@ def _filter_func(row: Gtk.ListBoxRow) -> bool:
     if session is None:
         return True
     return (
-        query in session["project"].lower()
+        query in session.get("short_name", "").lower()
+        or query in session["project"].lower()
         or query in session["preview"].lower()
         or query in session["session_id"].lower()
     )
@@ -368,12 +432,7 @@ def build_sessions_tab() -> Gtk.ScrolledWindow:
     # -----------------------------------------------------------------------
     # Initial load (non-blocking via idle_add)
     # -----------------------------------------------------------------------
-    def _initial_load() -> bool:
-        sessions = _scan_all_sessions()
-        _populate_list_box(sessions)
-        return False  # run once
-
-    GLib.idle_add(_initial_load)
+    idle_once(lambda: _populate_list_box(_scan_all_sessions()))
 
     scrolled.show_all()
     return scrolled

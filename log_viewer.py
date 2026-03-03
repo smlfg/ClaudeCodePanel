@@ -13,6 +13,8 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Pango
 
+from utils import idle_once
+
 USAGE_DIR = Path.home() / ".claude" / "usage"
 COACHING_LOG = Path.home() / ".claude" / "hooks" / "coaching" / "coaching_log.md"
 
@@ -22,7 +24,7 @@ _MAX_ENTRIES = 80
 _log_box = None
 _filter_combo = None
 _stats_label = None
-_last_count = 0
+_last_fingerprint = ("", 0)
 
 
 def build_logs_tab() -> Gtk.ScrolledWindow:
@@ -80,14 +82,13 @@ def build_logs_tab() -> Gtk.ScrolledWindow:
 
     scrolled.add(main_box)
 
-    # Initial load deferred
-    GLib.idle_add(refresh_logs)
+    idle_once(refresh_logs)
     return scrolled
 
 
 def refresh_logs() -> bool:
     """Refresh log data from disk. Returns True to keep timer alive."""
-    global _last_count
+    global _last_fingerprint
     if _log_box is None:
         return True
 
@@ -96,13 +97,13 @@ def refresh_logs() -> bool:
     entries.sort(key=lambda e: e.get("_sort_key", ""), reverse=True)
     entries = entries[:_MAX_ENTRIES]
 
-    # Only rebuild if count changed (avoid flicker)
-    if len(entries) == _last_count:
-        # Update stats only
+    # Only rebuild if content changed (count + latest sort key)
+    fingerprint = (entries[0].get("_sort_key", "") if entries else "", len(entries))
+    if fingerprint == _last_fingerprint:
         _update_stats(entries)
         return True
 
-    _last_count = len(entries)
+    _last_fingerprint = fingerprint
 
     # Clear and rebuild
     for child in _log_box.get_children():
@@ -265,11 +266,11 @@ def _update_stats(entries: list[dict]):
 
 def _on_clear(_button):
     """Clear the log view."""
-    global _last_count
+    global _last_fingerprint
     if _log_box is None:
         return
     for child in _log_box.get_children():
         _log_box.remove(child)
-    _last_count = 0
+    _last_fingerprint = ("", 0)
     if _stats_label:
         _stats_label.set_text("Cleared")
