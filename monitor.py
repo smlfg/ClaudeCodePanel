@@ -84,63 +84,211 @@ def _cache_set(key, value):
 
 
 # ---------------------------------------------------------------------------
-# Anthropic token pricing (per 1M tokens)
+# Anthropic token pricing (per 1M tokens) — Claude 4.x / 4.5 generation
+# model_id -> (input_$/1M, cache_write_$/1M, cache_read_$/1M, output_$/1M)
+# Source: https://docs.anthropic.com/en/docs/about-claude/models (March 2026)
 # ---------------------------------------------------------------------------
 ANTHROPIC_PRICING = {
-    "opus":   (15.0, 75.0),   # (input_$/1M, output_$/1M)
-    "sonnet": (3.0,  15.0),
-    "haiku":  (0.80,  4.0),
+    "claude-opus-4-6":   (5.00, 6.25, 0.50, 25.0),
+    "claude-sonnet-4-6": (3.00, 3.75, 0.30, 15.0),
+    "claude-haiku-4-5":  (1.00, 1.25, 0.10,  5.0),
 }
+DEFAULT_PRICING = (5.00, 6.25, 0.50, 25.0)  # Opus as conservative fallback
 
-SESSION_META_DIR = Path.home() / ".claude" / "usage-data" / "session-meta"
+
+# ---------------------------------------------------------------------------
+# Combined JSONL scanner — single pass for tokens + skills (cached 30s)
+# ---------------------------------------------------------------------------
+def _scan_session_jsonls(days: int = 1) -> dict:
+    """Single-pass scan of session JSONLs for tokens AND skills.
+
+    Returns: {
+        "tokens_by_date": {"2026-03-03": {"input": N, "cache_create": N, "cache_read": N, "output": N, "cost": F}},
+        "skills_by_date": {"2026-03-03": {"research": 3, "chef": 5}},
+    }
+    """
+    cache_key = f"jsonl_scan_{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    from collections import defaultdict
+
+    now = time.time()
+    cutoff_ts = now - (days * 86400)
+
+    tokens_by_date = defaultdict(lambda: {"input": 0, "cache_create": 0, "cache_read": 0, "output": 0, "cost": 0.0})
+    # Per-model breakdown: date -> model_tier -> {input, cache_create, cache_read, output, cost}
+    tokens_by_date_model = defaultdict(lambda: defaultdict(
+        lambda: {"input": 0, "cache_create": 0, "cache_read": 0, "output": 0, "cost": 0.0}
+    ))
+    skills_by_date = defaultdict(lambda: defaultdict(int))
+    sessions_by_date = defaultdict(set)
+
+    if not PROJECTS_DIR.exists():
+        result = {"tokens_by_date": dict(tokens_by_date), "skills_by_date": {k: dict(v) for k, v in skills_by_date.items()}}
+        _cache_set(cache_key, result)
+        return result
+
+    # Collect last usage per requestId to avoid streaming duplication.
+    # Streaming responses emit multiple usage objects per request — only
+    # the final one contains the cumulative (correct) token counts.
+    # Key: requestId -> (date_str, model_id, usage_dict, file_path)
+    request_usage = {}
+
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for f in project_dir.glob("*.jsonl"):
+            try:
+                mtime = f.stat().st_mtime
+            except (OSError, PermissionError):
+                continue
+            if mtime < cutoff_ts:
+                continue
+
+            try:
+                with f.open() as fh:
+                    for line in fh:
+                        has_usage = '"usage"' in line
+                        has_skill = '"name":"Skill"' in line or '"name": "Skill"' in line
+                        if not has_usage and not has_skill:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Extract date from timestamp
+                        ts = entry.get("timestamp", "")
+                        if not ts:
+                            continue
+                        date_str = ts[:10]  # "2026-03-03T..." -> "2026-03-03"
+
+                        msg = entry.get("message", {})
+
+                        # --- Token usage (dedup by requestId) ---
+                        if has_usage:
+                            usage = msg.get("usage")
+                            rid = entry.get("requestId", "")
+                            if usage and rid:
+                                model_id = msg.get("model", "")
+                                # Always overwrite — last entry per requestId wins
+                                request_usage[rid] = (date_str, model_id, usage, str(f))
+
+                        # --- Skill usage ---
+                        if has_skill:
+                            content = msg.get("content", [])
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, dict) and block.get("name") == "Skill":
+                                        skill_input = block.get("input", {})
+                                        skill_name = skill_input.get("skill", "unknown")
+                                        skills_by_date[date_str][skill_name] += 1
+            except (OSError, PermissionError):
+                continue
+
+    # Aggregate deduplicated usage into date buckets (total + per-model)
+    for date_str, model_id, usage, file_path in request_usage.values():
+        rate_in, rate_write, rate_read, rate_out = ANTHROPIC_PRICING.get(model_id, DEFAULT_PRICING)
+
+        inp = usage.get("input_tokens", 0)
+        cache_create = usage.get("cache_creation_input_tokens", 0)
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+
+        cost = (inp * rate_in
+                + cache_create * rate_write
+                + cache_read * rate_read
+                + out * rate_out) / 1_000_000
+
+        # Total bucket
+        bucket = tokens_by_date[date_str]
+        bucket["input"] += inp
+        bucket["cache_create"] += cache_create
+        bucket["cache_read"] += cache_read
+        bucket["output"] += out
+        bucket["cost"] += cost
+
+        # Per-model bucket (derive tier from model_id)
+        if "opus" in model_id:
+            tier = "opus"
+        elif "sonnet" in model_id:
+            tier = "sonnet"
+        elif "haiku" in model_id:
+            tier = "haiku"
+        else:
+            tier = "opus"  # conservative fallback
+        mb = tokens_by_date_model[date_str][tier]
+        mb["input"] += inp
+        mb["cache_create"] += cache_create
+        mb["cache_read"] += cache_read
+        mb["output"] += out
+        mb["cost"] += cost
+
+        sessions_by_date[date_str].add(file_path)
+
+    # Convert defaultdicts to regular dicts and add session counts
+    tokens_dict = {}
+    for d, bucket in tokens_by_date.items():
+        tokens_dict[d] = {
+            "input": bucket["input"],
+            "cache_create": bucket["cache_create"],
+            "cache_read": bucket["cache_read"],
+            "output": bucket["output"],
+            "cost": round(bucket["cost"], 6),
+            "sessions": len(sessions_by_date.get(d, set())),
+        }
+
+    # Convert per-model defaultdicts
+    models_dict = {}
+    for d, model_map in tokens_by_date_model.items():
+        models_dict[d] = {tier: dict(b) for tier, b in model_map.items()}
+
+    result = {
+        "tokens_by_date": tokens_dict,
+        "models_by_date": models_dict,
+        "skills_by_date": {k: dict(v) for k, v in skills_by_date.items()},
+    }
+    _cache_set(cache_key, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Cost & Tools
 # ---------------------------------------------------------------------------
 def get_anthropic_session_cost() -> dict:
-    """Read real token counts from Claude Code session metadata (cached 30s).
+    """Get real API token costs from session JSONL files for today (cached 30s).
 
-    Scans ~/.claude/usage-data/session-meta/*.json for today's sessions,
-    sums input/output tokens, and calculates cost at Opus rates.
+    Parses ~/.claude/projects/*/*.jsonl for actual Anthropic API usage data,
+    with model-specific pricing and cache token breakdown.
     """
     cached = _cache_get("anthropic_session_cost")
     if cached is not None:
         return cached
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    total_input = 0
-    total_output = 0
-    session_count = 0
+    scan = _scan_session_jsonls(days=1)
+    bucket = scan["tokens_by_date"].get(today, {})
 
-    if SESSION_META_DIR.is_dir():
-        for f in SESSION_META_DIR.glob("*.json"):
-            try:
-                data = json.loads(f.read_text())
-                # Prefer start_time field, fallback to file mtime
-                start = data.get("start_time", "")
-                if start:
-                    date_str = start[:10]  # "2026-03-03T..." -> "2026-03-03"
-                else:
-                    mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-                    date_str = mtime.strftime("%Y-%m-%d")
-                if date_str != today:
-                    continue
-                total_input += data.get("input_tokens", 0)
-                total_output += data.get("output_tokens", 0)
-                session_count += 1
-            except (OSError, json.JSONDecodeError, KeyError):
-                continue
-
-    # Default: Opus pricing (conservative — better too high than too low)
-    rate_in, rate_out = ANTHROPIC_PRICING["opus"]
-    cost = (total_input * rate_in + total_output * rate_out) / 1_000_000
+    # Per-model breakdown for today
+    models_today = scan["models_by_date"].get(today, {})
+    models = {}
+    for tier, mb in models_today.items():
+        models[tier] = {
+            "cost_usd": round(mb.get("cost", 0.0), 4),
+            "input_tokens": mb.get("input", 0) + mb.get("cache_create", 0),
+            "cache_read_tokens": mb.get("cache_read", 0),
+            "output_tokens": mb.get("output", 0),
+        }
 
     result = {
-        "cost_usd": round(cost, 4),
-        "input_tokens": total_input,
-        "output_tokens": total_output,
-        "sessions": session_count,
+        "cost_usd": round(bucket.get("cost", 0.0), 4),
+        "input_tokens": bucket.get("input", 0) + bucket.get("cache_create", 0),
+        "cache_read_tokens": bucket.get("cache_read", 0),
+        "output_tokens": bucket.get("output", 0),
+        "sessions": bucket.get("sessions", 0),
+        "models": models,
     }
     _cache_set("anthropic_session_cost", result)
     return result
@@ -317,7 +465,25 @@ def _get_session_preview(path: Path, max_len: int = 60) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Skills
+# Skill Usage (from session JSONLs)
+# ---------------------------------------------------------------------------
+def get_skill_usage(days: int = 1) -> dict[str, dict[str, int]]:
+    """Get skill usage counts grouped by date.
+
+    Returns: {"2026-03-03": {"research": 3, "chef": 5, ...}, ...}
+    """
+    cached = _cache_get(f"skill_usage_{days}")
+    if cached is not None:
+        return cached
+
+    scan = _scan_session_jsonls(days=days)
+    result = scan["skills_by_date"]
+    _cache_set(f"skill_usage_{days}", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Skills (missed skills from MyAIGame tracker)
 # ---------------------------------------------------------------------------
 def get_missed_skills() -> list[dict]:
     """Get today's missed skill suggestions."""
@@ -351,7 +517,7 @@ def get_usage_timeline() -> list[dict]:
     """Get usage data by date (last 7 days, cached 30s).
 
     Combines tool-call counts from usage-tracker JSONL files with
-    real token costs from session-meta (grouped by mtime date).
+    real token costs from session JSONL files (model-specific pricing).
     """
     cached = _cache_get("usage_timeline")
     if cached is not None:
@@ -371,42 +537,26 @@ def get_usage_timeline() -> list[dict]:
                 pass
             calls_by_date[f.stem] = count
 
-    # 2. Collect token costs per day from session-meta
-    costs_by_date: dict[str, float] = {}
-    tokens_by_date: dict[str, tuple[int, int]] = {}  # date -> (in, out)
-    if SESSION_META_DIR.is_dir():
-        for f in SESSION_META_DIR.glob("*.json"):
-            try:
-                data = json.loads(f.read_text())
-                # Prefer start_time field, fallback to file mtime
-                start = data.get("start_time", "")
-                if start:
-                    date_str = start[:10]
-                else:
-                    mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-                    date_str = mtime.strftime("%Y-%m-%d")
-                inp = data.get("input_tokens", 0)
-                out = data.get("output_tokens", 0)
-                rate_in, rate_out = ANTHROPIC_PRICING["opus"]
-                cost = (inp * rate_in + out * rate_out) / 1_000_000
-                costs_by_date[date_str] = costs_by_date.get(date_str, 0.0) + cost
-                prev_in, prev_out = tokens_by_date.get(date_str, (0, 0))
-                tokens_by_date[date_str] = (prev_in + inp, prev_out + out)
-            except (OSError, json.JSONDecodeError, KeyError):
-                continue
+    # 2. Real token costs from session JSONLs (7-day scan)
+    scan = _scan_session_jsonls(days=7)
+    tokens_by_date = scan["tokens_by_date"]
 
     # 3. Merge: all dates from both sources, sorted desc, limit 7
-    all_dates = sorted(set(calls_by_date) | set(costs_by_date), reverse=True)[:7]
+    all_dates = sorted(set(calls_by_date) | set(tokens_by_date), reverse=True)[:7]
     timeline = []
     for date_str in all_dates:
         calls = calls_by_date.get(date_str, 0)
-        cost = costs_by_date.get(date_str, 0.0)
-        inp, out = tokens_by_date.get(date_str, (0, 0))
+        bucket = tokens_by_date.get(date_str, {})
+        cost = bucket.get("cost", 0.0)
+        inp = bucket.get("input", 0) + bucket.get("cache_create", 0)
+        cache_read = bucket.get("cache_read", 0)
+        out = bucket.get("output", 0)
         timeline.append({
             "date": date_str,
             "calls": calls,
             "cost_est": round(cost, 4),
             "input_tokens": inp,
+            "cache_read_tokens": cache_read,
             "output_tokens": out,
         })
 
@@ -417,16 +567,21 @@ def get_usage_timeline() -> list[dict]:
 def get_provider_costs() -> dict[str, float]:
     """Get today's cost breakdown by provider (cached 30s).
 
-    Anthropic: real tokens from session-meta (no more flat-rate fiction).
+    Anthropic: real API tokens from session JSONLs (model-specific pricing).
     Others: from ~/.claude/usage/providers.jsonl (minimax, codex, gemini).
     """
     cached = _cache_get("provider_costs")
     if cached is not None:
         return cached
 
-    # 1. Anthropic: real token cost from session-meta
+    # 1. Anthropic: per-model costs from session JSONLs
     anthropic = get_anthropic_session_cost()
-    costs: dict[str, float] = {"anthropic": anthropic["cost_usd"]}
+    costs: dict[str, float] = {}
+    for tier in ("opus", "sonnet", "haiku"):
+        model_data = anthropic.get("models", {}).get(tier, {})
+        tier_cost = model_data.get("cost_usd", 0.0)
+        if tier_cost > 0:
+            costs[tier] = tier_cost
 
     # 2. Other providers: from providers.jsonl
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
