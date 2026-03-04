@@ -267,6 +267,145 @@ notebook tab:checked {{
 .watcher-dot-info {{ color: {p["accent"]}; font-size: 16px; }}
 .watcher-dot-inactive {{ color: {p["dim"]}; font-size: 16px; }}
 .watcher-name {{ font-family: monospace; font-size: 11px; color: {p["subtext1"]}; }}
+
+.sc-card {{
+    border-radius: 8px;
+    background: {p["card"]};
+    border: 1px solid {p["border"]};
+    padding: 10px;
+    margin: 4px 0;
+}}
+
+.sc-badge-mastered {{
+    background: {p["green_hover_bg"]};
+    color: {p["green"]};
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+
+.sc-badge-learning {{
+    background: {p["yellow_hover_bg"]};
+    color: {p["yellow"]};
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+
+.sc-badge-unused {{
+    background: rgba(243,139,168,0.2);
+    color: {p["red"]};
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+
+.sc-learn-card {{
+    border-left: 3px solid {p["red"]};
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: {p["card"]};
+    margin: 3px 0;
+}}
+
+.sc-learn-card:hover {{
+    background: {p["border"]};
+}}
+
+/* --- Log Viewer --- */
+.log-toolbar {{
+    background: {p["mantle"]};
+    border-radius: 8px;
+    padding: 6px 10px;
+}}
+
+.log-card {{
+    background: {p["card"]};
+    border-radius: 6px;
+    border: 1px solid {p["border"]};
+    padding: 6px 10px;
+    margin: 1px 0;
+}}
+
+.log-card:hover {{
+    background: {p["border"]};
+}}
+
+.log-card-tool {{ border-left: 3px solid {p["green"]}; }}
+.log-card-llm {{ border-left: 3px solid {p["accent"]}; }}
+.log-card-error {{ border-left: 3px solid {p["red"]}; }}
+.log-card-hook {{ border-left: 3px solid {p["mauve"]}; }}
+
+.log-time {{
+    font-family: monospace;
+    font-size: 10px;
+    color: {p["dim"]};
+}}
+
+.log-tool-name {{
+    font-family: monospace;
+    font-size: 11px;
+    font-weight: bold;
+    color: {p["text"]};
+}}
+
+.log-detail {{
+    font-size: 11px;
+    color: {p["subtext1"]};
+}}
+
+.log-cost {{
+    font-family: monospace;
+    font-size: 11px;
+    color: {p["yellow"]};
+}}
+
+.log-status-ok {{ color: {p["green"]}; }}
+.log-status-error {{ color: {p["red"]}; }}
+.log-status-neutral {{ color: {p["dim"]}; }}
+
+.log-stats {{
+    font-size: 11px;
+    color: {p["overlay"]};
+}}
+
+/* --- Swarm Tab --- */
+.swarm-toolbar {{
+    background: {p["mantle"]};
+    border-radius: 8px;
+    padding: 6px 10px;
+}}
+
+.swarm-btn {{
+    background: {p["card"]};
+    border-radius: 6px;
+    border: 1px solid {p["border"]};
+    padding: 4px 12px;
+    color: {p["text"]};
+}}
+
+.swarm-btn:hover {{
+    background: {p["border"]};
+}}
+
+.swarm-status-connected {{
+    color: {p["green"]};
+    font-weight: bold;
+}}
+
+.swarm-status-disconnected {{
+    color: {p["red"]};
+    font-weight: bold;
+}}
+
+.swarm-url {{
+    font-family: monospace;
+    font-size: 11px;
+    color: {p["dim"]};
+}}
 """.encode()
 
 

@@ -1,6 +1,6 @@
 """Log viewer widget for Claude Code Control Panel.
 
-TreeView-based log viewer with sortable columns, filtering, and cost tracking.
+Card-based log viewer with filtering and cost tracking.
 Reads today's usage JSONL + provider costs + coaching log.
 Auto-refreshes via external timer calling refresh_logs().
 """
@@ -22,31 +22,18 @@ PROVIDERS_FILE = USAGE_DIR / "providers.jsonl"
 
 _MAX_ENTRIES = 500
 
-# Column indices for ListStore
-_COL_TIME = 0       # str  HH:MM:SS
-_COL_TOOL = 1       # str  tool name / label
-_COL_DETAIL = 2     # str  file path, cmd_cat, or hook text
-_COL_COST = 3       # str  formatted cost string
-_COL_STATUS = 4     # str  "✓" / "✗" / "—"
-_COL_TYPE = 5       # str  entry type: "tool" / "error" / "hook" / "llm"
-_COL_TOOLTIP = 6    # str  full detail for tooltip
-_COL_COST_F = 7     # float  numeric cost for sorting
-_COL_SORTKEY = 8    # str  ISO timestamp for sort
-
 # Module-level widget references
-_treeview = None
-_liststore = None
-_model_filter = None
 _filter_combo = None
 _search_entry = None
 _stats_label = None
+_cards_container = None
+_last_entries = []
 _last_fingerprint = ("", 0)
 
 
 def build_logs_tab() -> Gtk.ScrolledWindow:
     """Build and return the Logs tab widget."""
-    global _treeview, _liststore, _model_filter
-    global _filter_combo, _search_entry, _stats_label
+    global _filter_combo, _search_entry, _stats_label, _cards_container
 
     outer = Gtk.ScrolledWindow()
     outer.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -59,6 +46,7 @@ def build_logs_tab() -> Gtk.ScrolledWindow:
 
     # --- Toolbar ---
     toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    toolbar.get_style_context().add_class("log-toolbar")
 
     filter_label = Gtk.Label(label="Filter:")
     toolbar.pack_start(filter_label, False, False, 0)
@@ -77,8 +65,9 @@ def build_logs_tab() -> Gtk.ScrolledWindow:
     toolbar.pack_start(_search_entry, False, False, 0)
 
     _stats_label = Gtk.Label(label="")
-    _stats_label.set_xalign(1)
+    _stats_label.set_xalign(1.0)
     _stats_label.set_hexpand(True)
+    _stats_label.get_style_context().add_class("log-stats")
     toolbar.pack_start(_stats_label, True, True, 0)
 
     main_box.pack_start(toolbar, False, False, 0)
@@ -86,58 +75,15 @@ def build_logs_tab() -> Gtk.ScrolledWindow:
         Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0
     )
 
-    # --- ListStore: 9 columns ---
-    _liststore = Gtk.ListStore(str, str, str, str, str, str, str, float, str)
+    # --- Inner scroll for cards ---
+    inner_scroll = Gtk.ScrolledWindow()
+    inner_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    inner_scroll.set_vexpand(True)
 
-    # --- Filter model ---
-    _model_filter = Gtk.TreeModelFilter(child_model=_liststore)
-    _model_filter.set_visible_func(_row_visible)
+    _cards_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    inner_scroll.add(_cards_container)
 
-    # --- Sort model on top of filter ---
-    sort_model = Gtk.TreeModelSort(model=_model_filter)
-
-    # --- TreeView ---
-    _treeview = Gtk.TreeView(model=sort_model)
-    _treeview.set_headers_clickable(True)
-    _treeview.set_rules_hint(True)
-    _treeview.set_tooltip_column(_COL_TOOLTIP)
-
-    # Column: Zeit
-    col_time = _make_text_column("Zeit", _COL_TIME, sort_col=_COL_SORTKEY,
-                                 sort_model=sort_model, width=75)
-    _treeview.append_column(col_time)
-
-    # Column: Tool
-    col_tool = _make_text_column("Tool", _COL_TOOL, sort_col=_COL_TOOL,
-                                 sort_model=sort_model, width=120, monospace=True)
-    _treeview.append_column(col_tool)
-
-    # Column: Detail (file/cmd_cat/hook text)
-    col_detail = _make_text_column("Detail", _COL_DETAIL, sort_col=None,
-                                   sort_model=sort_model, width=200, ellipsize=True)
-    _treeview.append_column(col_detail)
-
-    # Column: Cost
-    col_cost = _make_text_column("Cost", _COL_COST, sort_col=_COL_COST_F,
-                                 sort_model=sort_model, width=70, xalign=1.0)
-    _treeview.append_column(col_cost)
-
-    # Column: Status — with cell data function for coloring
-    renderer_status = Gtk.CellRendererText()
-    renderer_status.set_property("xalign", 0.5)
-    col_status = Gtk.TreeViewColumn("Sta", renderer_status, text=_COL_STATUS)
-    col_status.set_fixed_width(40)
-    col_status.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
-    col_status.set_cell_data_func(renderer_status, _status_cell_data_func)
-    _treeview.append_column(col_status)
-
-    # Scroll for TreeView
-    tv_scroll = Gtk.ScrolledWindow()
-    tv_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-    tv_scroll.set_vexpand(True)
-    tv_scroll.add(_treeview)
-
-    main_box.pack_start(tv_scroll, True, True, 0)
+    main_box.pack_start(inner_scroll, True, True, 0)
     outer.add(main_box)
 
     idle_once(refresh_logs)
@@ -146,9 +92,9 @@ def build_logs_tab() -> Gtk.ScrolledWindow:
 
 def refresh_logs() -> bool:
     """Refresh log data from disk. Returns True to keep timer alive."""
-    global _last_fingerprint
+    global _last_fingerprint, _last_entries
     try:
-        if _liststore is None:
+        if _cards_container is None:
             return True
 
         entries = _read_usage_entries() + _read_coaching_entries() + _read_provider_costs_today()
@@ -160,11 +106,9 @@ def refresh_logs() -> bool:
             _update_stats(entries)
             return True
 
-        _liststore.clear()
-        for entry in entries:
-            _liststore.append(_entry_to_row(entry))
-
+        _last_entries = entries
         _last_fingerprint = fingerprint
+        _rebuild_cards()
         _update_stats(entries)
     except Exception:
         pass
@@ -175,7 +119,7 @@ def refresh_logs() -> bool:
 # Data reading
 # ---------------------------------------------------------------------------
 
-def _read_usage_entries() -> list[dict]:
+def _read_usage_entries() -> list:
     """Read today's usage JSONL (tool calls)."""
     today_file = USAGE_DIR / f"{date.today().isoformat()}.jsonl"
     if not today_file.exists():
@@ -201,7 +145,7 @@ def _read_usage_entries() -> list[dict]:
     return entries
 
 
-def _read_coaching_entries() -> list[dict]:
+def _read_coaching_entries() -> list:
     """Read last 20 lines from coaching log as hook entries."""
     if not COACHING_LOG.exists():
         return []
@@ -224,7 +168,7 @@ def _read_coaching_entries() -> list[dict]:
     return entries
 
 
-def _read_provider_costs_today() -> list[dict]:
+def _read_provider_costs_today() -> list:
     """Read today's provider entries from providers.jsonl."""
     today = date.today().isoformat()
     if not PROVIDERS_FILE.exists():
@@ -254,8 +198,8 @@ def _read_provider_costs_today() -> list[dict]:
 # Row building
 # ---------------------------------------------------------------------------
 
-def _entry_to_row(entry: dict) -> list:
-    """Convert an entry dict to a ListStore row (9 values)."""
+def _entry_to_row(entry: dict) -> dict:
+    """Convert an entry dict to a row dict."""
     etype = entry.get("_type", "tool")
     sort_key = entry.get("_sort_key", "")
 
@@ -274,9 +218,9 @@ def _entry_to_row(entry: dict) -> list:
         file_path = entry.get("file", "")
         cmd_cat = entry.get("cmd_cat", "")
         detail = file_path or cmd_cat or ""
-        # Shorten absolute paths for display
-        if detail.startswith("/home/smlflg/"):
-            detail = "~/" + detail[len("/home/smlflg/"):]
+        _home_prefix = str(Path.home()) + "/"
+        if detail.startswith(_home_prefix):
+            detail = "~/" + detail[len(_home_prefix):]
         tooltip = f"{tool} {file_path or cmd_cat or ''}".strip()
         cost_f = 0.0
         cost_str = ""
@@ -291,10 +235,17 @@ def _entry_to_row(entry: dict) -> list:
         provider = entry.get("provider", "?")
         model = entry.get("model", "")
         tool = f"{provider}/{model}" if model else provider
-        cost_f = float(entry.get("cost_usd", 0.0))
+        try:
+            cost_f = float(entry.get("cost_usd", 0.0))
+        except (TypeError, ValueError):
+            cost_f = 0.0
         cost_str = f"${cost_f:.4f}" if cost_f else ""
-        elapsed = entry.get("elapsed_s")
-        detail = f"{elapsed:.1f}s" if elapsed else ""
+        try:
+            elapsed = float(entry.get("elapsed_s", 0))
+            detail = f"{elapsed:.1f}s" if elapsed else ""
+        except (TypeError, ValueError):
+            elapsed = 0
+            detail = ""
         tooltip = f"{provider} {model} cost={cost_str}".strip()
         status = "—"
         row_type = "llm"
@@ -318,64 +269,105 @@ def _entry_to_row(entry: dict) -> list:
         status = "—"
         row_type = etype
 
-    return [
-        time_str,   # _COL_TIME
-        tool,       # _COL_TOOL
-        detail,     # _COL_DETAIL
-        cost_str,   # _COL_COST
-        status,     # _COL_STATUS
-        row_type,   # _COL_TYPE
-        tooltip,    # _COL_TOOLTIP
-        cost_f,     # _COL_COST_F
-        sort_key,   # _COL_SORTKEY
-    ]
+    return {
+        "time_str": time_str,
+        "tool": tool,
+        "detail": detail,
+        "cost_str": cost_str,
+        "status": status,
+        "row_type": row_type,
+        "tooltip": tooltip,
+        "cost_f": cost_f,
+        "sort_key": sort_key,
+    }
 
 
 # ---------------------------------------------------------------------------
-# TreeView helpers
+# Card building
 # ---------------------------------------------------------------------------
 
-def _make_text_column(title: str, text_col: int, sort_col, sort_model,
-                      width: int = 100, monospace: bool = False,
-                      xalign: float = 0.0, ellipsize: bool = False) -> Gtk.TreeViewColumn:
-    renderer = Gtk.CellRendererText()
-    renderer.set_property("xalign", xalign)
-    if monospace:
-        renderer.set_property("font", "Monospace 9")
-    if ellipsize:
-        renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+def _build_card(row: dict) -> Gtk.Box:
+    """Create a single HBox card widget from a row dict."""
+    row_type = row["row_type"]
 
-    col = Gtk.TreeViewColumn(title, renderer, text=text_col)
-    col.set_fixed_width(width)
-    col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
-    col.set_resizable(True)
+    card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    ctx = card.get_style_context()
+    ctx.add_class("log-card")
+    ctx.add_class(f"log-card-{row_type}")
 
-    if sort_col is not None:
-        # Map from filter-model column to sort-model column (same indices)
-        col.set_sort_column_id(sort_col)
+    if row["tooltip"]:
+        card.set_tooltip_text(row["tooltip"])
 
-    return col
+    # Time label — fixed 65px
+    time_lbl = Gtk.Label(label=row["time_str"])
+    time_lbl.set_size_request(65, -1)
+    time_lbl.set_xalign(0.0)
+    time_lbl.get_style_context().add_class("log-time")
+    card.pack_start(time_lbl, False, False, 0)
 
+    # Tool label — fixed 120px, ellipsize
+    tool_lbl = Gtk.Label(label=row["tool"])
+    tool_lbl.set_size_request(120, -1)
+    tool_lbl.set_xalign(0.0)
+    tool_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+    tool_lbl.get_style_context().add_class("log-tool-name")
+    card.pack_start(tool_lbl, False, False, 0)
 
-def _status_cell_data_func(col, renderer, model, it, data):
-    """Color the status cell based on value."""
-    status = model.get_value(it, _COL_STATUS)
+    # Detail label — hexpand, ellipsize
+    detail_lbl = Gtk.Label(label=row["detail"])
+    detail_lbl.set_hexpand(True)
+    detail_lbl.set_xalign(0.0)
+    detail_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+    detail_lbl.get_style_context().add_class("log-detail")
+    card.pack_start(detail_lbl, True, True, 0)
+
+    # Status label — fixed 20px
+    status = row["status"]
+    status_lbl = Gtk.Label(label=status)
+    status_lbl.set_size_request(20, -1)
+    status_lbl.set_xalign(0.5)
+    status_ctx = status_lbl.get_style_context()
     if status == "✓":
-        renderer.set_property("foreground", "#a6e3a1")  # Catppuccin green
+        status_ctx.add_class("log-status-ok")
     elif status == "✗":
-        renderer.set_property("foreground", "#f38ba8")  # Catppuccin red
+        status_ctx.add_class("log-status-error")
     else:
-        renderer.set_property("foreground", "#585b70")  # dim
+        status_ctx.add_class("log-status-neutral")
+    card.pack_start(status_lbl, False, False, 0)
+
+    # Cost label — fixed 65px, right-aligned
+    cost_lbl = Gtk.Label(label=row["cost_str"])
+    cost_lbl.set_size_request(65, -1)
+    cost_lbl.set_xalign(1.0)
+    cost_lbl.get_style_context().add_class("log-cost")
+    card.pack_start(cost_lbl, False, False, 0)
+
+    return card
+
+
+def _rebuild_cards():
+    """Clear and rebuild the cards container from _last_entries."""
+    if _cards_container is None:
+        return
+    for child in _cards_container.get_children():
+        _cards_container.remove(child)
+
+    filtered = _filter_entries(_last_entries)
+    for entry in filtered:
+        row = _entry_to_row(entry)
+        card = _build_card(row)
+        _cards_container.pack_start(card, False, False, 0)
+    _cards_container.show_all()
 
 
 # ---------------------------------------------------------------------------
 # Filtering
 # ---------------------------------------------------------------------------
 
-def _row_visible(model, it, data) -> bool:
-    """Visibility function for Gtk.TreeModelFilter."""
+def _filter_entries(entries: list) -> list:
+    """Filter entries by combo selection and search text."""
     if _filter_combo is None:
-        return True
+        return entries
 
     active = _filter_combo.get_active_text() or "Alle"
     type_map = {
@@ -386,35 +378,48 @@ def _row_visible(model, it, data) -> bool:
         "Hooks": "hook",
     }
     filter_type = type_map.get(active)
-    row_type = model.get_value(it, _COL_TYPE)
-
-    if filter_type is not None and row_type != filter_type:
-        return False
 
     search_text = ""
     if _search_entry is not None:
         search_text = (_search_entry.get_text() or "").lower().strip()
 
-    if search_text:
-        tool = (model.get_value(it, _COL_TOOL) or "").lower()
-        detail = (model.get_value(it, _COL_DETAIL) or "").lower()
-        if search_text not in tool and search_text not in detail:
-            return False
+    result = []
+    for entry in entries:
+        etype = entry.get("_type", "tool")
+        # For error filtering: match on entry error field
+        if filter_type == "error":
+            if not entry.get("error"):
+                continue
+        elif filter_type is not None:
+            if etype != filter_type:
+                continue
 
-    return True
+        if search_text:
+            tool_val = (entry.get("tool", "") or entry.get("provider", "") or etype or "").lower()
+            detail_val = (
+                entry.get("file", "") or
+                entry.get("cmd_cat", "") or
+                entry.get("text", "") or
+                entry.get("model", "") or
+                ""
+            ).lower()
+            if search_text not in tool_val and search_text not in detail_val:
+                continue
+
+        result.append(entry)
+    return result
 
 
 def _on_filter_changed(_widget):
-    """Refilter when combo or search entry changes."""
-    if _model_filter is not None:
-        _model_filter.refilter()
+    """Rebuild cards when combo or search entry changes."""
+    _rebuild_cards()
 
 
 # ---------------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------------
 
-def _update_stats(entries: list[dict]):
+def _update_stats(entries: list):
     if _stats_label is None:
         return
     tool_count = sum(1 for e in entries if e.get("_type") == "tool")

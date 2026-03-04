@@ -22,6 +22,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gtk, GLib, WebKit2
+from theme import get_palette
 
 DASHBOARD_PORT = 5111
 DASHBOARD_URL = f"http://localhost:{DASHBOARD_PORT}"
@@ -31,6 +32,7 @@ VENV_PYTHON = DASHBOARD_DIR / "venv" / "bin" / "python3"
 # Module-level refs for refresh
 _webview = None
 _status_label = None
+_spinner = None
 _server_proc = None
 _retry_count = 0
 
@@ -77,22 +79,27 @@ def _ensure_server():
 
 
 def _update_status(connected: bool):
-    """Update the status label."""
+    """Update the status label and spinner."""
     if _status_label is None:
         return
+    ctx = _status_label.get_style_context()
+    ctx.remove_class("swarm-status-connected")
+    ctx.remove_class("swarm-status-disconnected")
     if connected:
-        _status_label.set_markup(
-            '<span foreground="#a6e3a1">● Verbunden</span>'
-        )
+        ctx.add_class("swarm-status-connected")
+        _status_label.set_text("● Verbunden")
+        if _spinner is not None:
+            _spinner.stop()
     else:
-        _status_label.set_markup(
-            '<span foreground="#f38ba8">● Getrennt</span>'
-        )
+        ctx.add_class("swarm-status-disconnected")
+        _status_label.set_text("● Getrennt")
+        if _spinner is not None:
+            _spinner.start()
 
 
 def build_swarm_tab() -> Gtk.Box:
     """Build and return the Swarm tab widget."""
-    global _webview, _status_label
+    global _webview, _status_label, _spinner
 
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
@@ -102,23 +109,29 @@ def build_swarm_tab() -> Gtk.Box:
     toolbar.set_margin_end(8)
     toolbar.set_margin_top(6)
     toolbar.set_margin_bottom(4)
+    toolbar.get_style_context().add_class("swarm-toolbar")
 
     reload_btn = Gtk.Button(label="⟳ Reload")
     reload_btn.set_tooltip_text("Dashboard neu laden")
     reload_btn.connect("clicked", _on_reload)
+    reload_btn.get_style_context().add_class("swarm-btn")
     toolbar.pack_start(reload_btn, False, False, 0)
 
     browser_btn = Gtk.Button(label="↗ Browser")
     browser_btn.set_tooltip_text("Im Browser öffnen")
     browser_btn.connect("clicked", _on_open_browser)
+    browser_btn.get_style_context().add_class("swarm-btn")
     toolbar.pack_start(browser_btn, False, False, 0)
+
+    _spinner = Gtk.Spinner()
+    toolbar.pack_end(_spinner, False, False, 0)
 
     _status_label = Gtk.Label()
     _status_label.set_xalign(1.0)
-    toolbar.pack_end(_status_label, False, False, 0)
+    toolbar.pack_end(_status_label, False, False, 4)
 
     url_label = Gtk.Label(label=DASHBOARD_URL)
-    url_label.set_opacity(0.5)
+    url_label.get_style_context().add_class("swarm-url")
     url_label.set_xalign(1.0)
     toolbar.pack_end(url_label, False, False, 8)
 
@@ -147,13 +160,14 @@ def build_swarm_tab() -> Gtk.Box:
     else:
         # Server starting — retry after 2s
         _update_status(False)
+        p = get_palette()
         _webview.load_html(
-            '<html><body style="background:#1e1e2e;color:#cdd6f4;font-family:system-ui;'
+            f'<html><body style="background:{p["bg"]};color:{p["text"]};font-family:system-ui;'
             'display:flex;align-items:center;justify-content:center;height:100vh;'
             'flex-direction:column;gap:12px">'
             '<div style="font-size:24px;opacity:0.4">⟳</div>'
             '<div>Server startet...</div>'
-            '<div style="font-size:12px;color:#a6adc8">Automatischer Retry alle 2s</div>'
+            f'<div style="font-size:12px;color:{p["overlay"]}">Automatischer Retry alle 2s</div>'
             '</body></html>',
             None
         )
@@ -179,14 +193,15 @@ def _retry_load() -> bool:
         _retry_count = 0
         if _webview:
             log_hint = str(LOG_FILE)
+            p = get_palette()
             _webview.load_html(
-                '<html><body style="background:#1e1e2e;color:#f38ba8;font-family:system-ui;'
+                f'<html><body style="background:{p["bg"]};color:{p["red"]};font-family:system-ui;'
                 'display:flex;align-items:center;justify-content:center;height:100vh;'
                 'flex-direction:column;gap:12px">'
                 '<div style="font-size:24px">Server-Fehler</div>'
-                f'<div style="font-size:12px;color:#a6adc8">Log: {log_hint}</div>'
-                '<button onclick="location.reload()" style="background:#313244;color:#cdd6f4;'
-                'border:1px solid #45475a;border-radius:6px;padding:8px 16px;cursor:pointer;'
+                f'<div style="font-size:12px;color:{p["overlay"]}">Log: {log_hint}</div>'
+                f'<button onclick="location.reload()" style="background:{p["card"]};color:{p["text"]};'
+                f'border:1px solid {p["border"]};border-radius:6px;padding:8px 16px;cursor:pointer;'
                 'font-size:13px;margin-top:8px">Retry</button>'
                 '</body></html>',
                 None
