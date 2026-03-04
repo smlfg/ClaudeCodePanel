@@ -261,6 +261,12 @@ notebook tab:checked {{
     color: {p["accent"]};
     border-bottom: 2px solid {p["accent"]};
 }}
+
+.watcher-dot-critical {{ color: {p["red"]}; font-size: 16px; }}
+.watcher-dot-warning {{ color: {p["yellow"]}; font-size: 16px; }}
+.watcher-dot-info {{ color: {p["accent"]}; font-size: 16px; }}
+.watcher-dot-inactive {{ color: {p["dim"]}; font-size: 16px; }}
+.watcher-name {{ font-family: monospace; font-size: 11px; color: {p["subtext1"]}; }}
 """.encode()
 
 

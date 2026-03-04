@@ -15,7 +15,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import Gtk, GLib, Gdk, Pango, AyatanaAppIndicator3
+from gi.repository import Gtk, GLib, Gdk, Pango, Gio, AyatanaAppIndicator3
 
 from config_io import (
     read_settings,
@@ -34,6 +34,7 @@ from monitor import (
     get_provider_costs,
     get_anthropic_session_cost,
     get_skill_usage,
+    get_sidecar_status,
     format_cost,
 )
 from log_viewer import build_logs_tab, refresh_logs
@@ -41,6 +42,7 @@ from session_browser import build_sessions_tab, refresh_sessions
 from process_manager import build_processes_tab, refresh_processes
 from theme import build_css, setup_theme_watcher
 from utils import idle_once
+from swarm_tab import build_swarm_tab, refresh_swarm
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,14 @@ SHORTCUTS = [
         "path": "~/AiSystemForVibeCoding/",
         "tooltip": "MultiKanal Agent Daemon — Narration + TTS",
         "command": "xdg-open http://localhost:8000/docs",
+        "category": "service",
+    },
+    {
+        "label": "Swarm Dashboard",
+        "icon": "network-workgroup",
+        "path": "~/Projekte/AgentSwarmDashboard/",
+        "tooltip": "Agent Swarm Dashboard — Team Graph, Kanban, Feed",
+        "command": "xdg-open http://localhost:5111",
         "category": "service",
     },
     # --- Referenz-Diagramme (Blue — interactive HTML dashboards) ---
@@ -327,6 +337,7 @@ class ControlPanel(Gtk.Window):
         self.notebook.append_page(build_logs_tab(), Gtk.Label(label="Logs"))
         self.notebook.append_page(build_sessions_tab(), Gtk.Label(label="Sessions"))
         self.notebook.append_page(build_processes_tab(), Gtk.Label(label="Prozesse"))
+        self.notebook.append_page(build_swarm_tab(), Gtk.Label(label="Swarm"))
 
         # Bottom status bar
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -359,6 +370,7 @@ class ControlPanel(Gtk.Window):
         GLib.timeout_add_seconds(60, refresh_sessions)
         GLib.timeout_add_seconds(30, refresh_processes)
         GLib.timeout_add_seconds(30, self._refresh_cost)
+        GLib.timeout_add_seconds(30, refresh_swarm)
 
     def _start_monitor_timer(self) -> bool:
         """One-shot: starts the 30s monitor timer (offset from hub by 15s)."""
@@ -459,6 +471,61 @@ class ControlPanel(Gtk.Window):
                 "cost": cost_lbl,
                 "color": color,
             }
+
+        # --- Sidecar Watcher ---
+        watcher_label = Gtk.Label(label="Sidecar Watcher", xalign=0)
+        watcher_label.get_style_context().add_class("section-title")
+        vbox.pack_start(watcher_label, False, False, 4)
+
+        watcher_frame = Gtk.Frame()
+        watcher_frame.get_style_context().add_class("section-frame")
+        watcher_grid = Gtk.Grid()
+        watcher_grid.set_column_spacing(8)
+        watcher_grid.set_row_spacing(4)
+        watcher_grid.set_margin_top(8)
+        watcher_grid.set_margin_bottom(8)
+        watcher_grid.set_margin_start(10)
+        watcher_grid.set_margin_end(10)
+
+        # Detector grid layout: (name, abbrev, row, col)
+        _DETECTOR_LAYOUT = [
+            ("ERROR-CASCADE", "ERR-CASC", 0, 0),
+            ("YOLO",          "YOLO",     0, 1),
+            ("THRASH",        "THRSH",    0, 2),
+            ("LOOP",          "LOOP",     1, 0),
+            ("DRIFT",         "DRIFT",    1, 1),
+            ("ANTI-PATTERN",  "ANTI",     1, 2),
+            ("READ-STORM",    "READ-S",   2, 0),
+            ("STALL",         "STALL",    2, 1),
+            ("SKILL-SUGGEST", "SKILL",    2, 2),
+        ]
+
+        self._watcher_slots = {}
+        for det_name, abbrev, row_idx, col_idx in _DETECTOR_LAYOUT:
+            cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+            dot = Gtk.Label(label="\u25CF")
+            dot.get_style_context().add_class("watcher-dot-inactive")
+            cell.pack_start(dot, False, False, 0)
+
+            name_lbl = Gtk.Label(label=abbrev, xalign=0)
+            name_lbl.get_style_context().add_class("watcher-name")
+            cell.pack_start(name_lbl, False, False, 0)
+
+            watcher_grid.attach(cell, col_idx, row_idx, 1, 1)
+            self._watcher_slots[det_name] = {"dot": dot, "label": name_lbl}
+
+        watcher_frame.add(watcher_grid)
+        vbox.pack_start(watcher_frame, False, False, 4)
+
+        # Set up Gio.FileMonitor on /tmp for sidecar file changes
+        self._sidecar_monitor = None
+        try:
+            gio_dir = Gio.File.new_for_path("/tmp")
+            self._sidecar_monitor = gio_dir.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            self._sidecar_monitor.connect("changed", self._on_sidecar_changed)
+        except Exception:
+            pass
 
         # --- Diagrams (compact chip-style FlowBox) ---
         diagrams_label = Gtk.Label(label="Diagramme", xalign=0)
@@ -819,9 +886,61 @@ class ControlPanel(Gtk.Window):
                 self.hub_missed_label.set_text("\n".join(lines))
             else:
                 self.hub_missed_label.set_text("Keine verpassten Skills heute")
+
+            # Sidecar watcher
+            sidecar = get_sidecar_status()
+            self._update_watcher(sidecar)
         except Exception:
             pass  # keep timer alive
         return True  # keep 30s timer alive
+
+    def _update_watcher(self, data: dict) -> None:
+        """Update watcher dot colors and tooltips from sidecar status dict."""
+        detectors = data.get("detectors", {})
+        for det_name, slot in self._watcher_slots.items():
+            det = detectors.get(det_name, {})
+            active = det.get("active", False)
+            severity = det.get("severity", "info")
+            last_seen = det.get("last_seen")
+            count = det.get("count", 0)
+
+            # Remove all existing style classes from dot
+            ctx = slot["dot"].get_style_context()
+            for cls in ("watcher-dot-critical", "watcher-dot-warning",
+                        "watcher-dot-info", "watcher-dot-inactive"):
+                ctx.remove_class(cls)
+
+            if active:
+                ctx.add_class(f"watcher-dot-{severity}")
+                tooltip = f"{det_name}: {count}x"
+                if last_seen:
+                    tooltip += f" (zuletzt {last_seen})"
+            else:
+                ctx.add_class("watcher-dot-inactive")
+                tooltip = f"{det_name}: inaktiv"
+
+            slot["dot"].set_tooltip_text(tooltip)
+            slot["label"].set_tooltip_text(tooltip)
+
+    def _on_sidecar_changed(self, _monitor, file_obj, _other, event_type) -> None:
+        """Called when a file in /tmp changes. Trigger watcher refresh if sidecar file."""
+        if event_type not in (
+            Gio.FileMonitorEvent.CHANGED,
+            Gio.FileMonitorEvent.CREATED,
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+        ):
+            return
+        name = file_obj.get_basename() if file_obj else ""
+        if name and (name.startswith("sidecar-") and name.endswith(".json")):
+            GLib.idle_add(self._refresh_watcher_once)
+
+    def _refresh_watcher_once(self) -> bool:
+        """One-shot idle callback: refresh watcher section only."""
+        try:
+            self._update_watcher(get_sidecar_status())
+        except Exception:
+            pass
+        return False  # one-shot
 
     # -----------------------------------------------------------------------
     # Tab 2: Settings
@@ -1572,6 +1691,12 @@ class ControlPanel(Gtk.Window):
                 # Clean up empty _disabled
                 if not settings["_disabled"]:
                     del settings["_disabled"]
+
+                # Sync voicemode systemd service with MCP toggle state
+                if "voicemode" in settings.get("mcpServers", {}):
+                    subprocess.run(["systemctl", "--user", "start", "voicemode-edge-tts"], capture_output=True)
+                elif "voicemode" in settings.get("_disabled", {}):
+                    subprocess.run(["systemctl", "--user", "stop", "voicemode-edge-tts"], capture_output=True)
 
             # Hook timeouts and async flags
             for hw in self.hook_widgets:

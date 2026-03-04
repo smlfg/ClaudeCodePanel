@@ -91,7 +91,7 @@ def _cache_set(key, value):
 ANTHROPIC_PRICING = {
     "claude-opus-4-6":   (5.00, 6.25, 0.50, 25.0),
     "claude-sonnet-4-6": (3.00, 3.75, 0.30, 15.0),
-    "claude-haiku-4-5":  (1.00, 1.25, 0.10,  5.0),
+    "claude-haiku-4-5-20251001":  (1.00, 1.25, 0.10,  5.0),
 }
 DEFAULT_PRICING = (5.00, 6.25, 0.50, 25.0)  # Opus as conservative fallback
 
@@ -139,7 +139,7 @@ def _scan_session_jsonls(days: int = 1) -> dict:
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
-        for f in project_dir.glob("*.jsonl"):
+        for f in project_dir.glob("**/*.jsonl"):
             try:
                 mtime = f.stat().st_mtime
             except (OSError, PermissionError):
@@ -369,7 +369,7 @@ def _scan_sessions():
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
-        for f in project_dir.glob("*.jsonl"):
+        for f in project_dir.glob("**/*.jsonl"):
             try:
                 stat = f.stat()
             except (OSError, PermissionError):
@@ -577,11 +577,13 @@ def get_provider_costs() -> dict[str, float]:
     # 1. Anthropic: per-model costs from session JSONLs
     anthropic = get_anthropic_session_cost()
     costs: dict[str, float] = {}
+    anthropic_total = 0.0
     for tier in ("opus", "sonnet", "haiku"):
         model_data = anthropic.get("models", {}).get(tier, {})
         tier_cost = model_data.get("cost_usd", 0.0)
-        if tier_cost > 0:
-            costs[tier] = tier_cost
+        anthropic_total += tier_cost
+    if anthropic_total > 0:
+        costs["anthropic"] = anthropic_total
 
     # 2. Other providers: from providers.jsonl
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -617,3 +619,110 @@ def format_cost(usd: float) -> str:
     if usd < 0.01:
         return f"${usd:.4f}"
     return f"${usd:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Sidecar Watcher — reads /tmp/sidecar-*.json + /tmp/claude-sidecar.log
+# ---------------------------------------------------------------------------
+DETECTOR_SEVERITY = {
+    "ERROR-CASCADE": "critical",
+    "YOLO": "critical",
+    "THRASH": "critical",
+    "LOOP": "warning",
+    "DRIFT": "warning",
+    "ANTI-PATTERN": "warning",
+    "READ-STORM": "warning",
+    "STALL": "info",
+    "SKILL-SUGGEST": "info",
+}
+
+_SIDECAR_LOG = Path("/tmp/claude-sidecar.log")
+_SIDECAR_CACHE_TTL = 10  # shorter TTL for real-time monitoring
+
+
+def get_sidecar_status() -> dict:
+    """Read sidecar files and parse detector status (cached 10s).
+
+    Returns:
+    {
+        "active_sessions": 3,
+        "detectors": {
+            "LOOP": {"active": True, "severity": "warning", "last_seen": "14:32", "count": 3},
+            ...
+        },
+        "overall_severity": "warning",
+    }
+    """
+    cached = _cache_get("sidecar_status")
+    if cached is not None:
+        return cached
+
+    # Count active sidecar session files
+    sidecar_files = sorted(
+        Path("/tmp").glob("sidecar-*.json"),
+        key=lambda f: f.stat().st_mtime if f.exists() else 0,
+        reverse=True,
+    )
+    active_sessions = len(sidecar_files)
+
+    # Init all detectors as inactive
+    detectors: dict[str, dict] = {}
+    for name, severity in DETECTOR_SEVERITY.items():
+        detectors[name] = {
+            "active": False,
+            "severity": severity,
+            "last_seen": None,
+            "count": 0,
+        }
+
+    # Parse last 50 lines of sidecar log for detector mentions
+    if _SIDECAR_LOG.exists():
+        try:
+            lines = _SIDECAR_LOG.read_text(errors="replace").splitlines()
+            for line in lines[-50:]:
+                # Format: [2026-03-04 14:32:01] session=abc tool=Bash findings=2 score=0.7 detectors=LOOP,STALL
+                if "detectors=" not in line:
+                    continue
+                # Extract timestamp
+                time_str = None
+                if line.startswith("["):
+                    bracket_end = line.find("]")
+                    if bracket_end > 0:
+                        ts_part = line[1:bracket_end]  # "2026-03-04 14:32:01"
+                        if " " in ts_part:
+                            time_str = ts_part.split(" ", 1)[1][:5]  # "14:32"
+
+                # Extract detectors
+                det_start = line.find("detectors=") + len("detectors=")
+                det_end = line.find(" ", det_start)
+                det_str = line[det_start:] if det_end == -1 else line[det_start:det_end]
+                det_str = det_str.strip()
+
+                for det_name in det_str.split(","):
+                    det_name = det_name.strip().upper()
+                    if det_name in detectors:
+                        detectors[det_name]["active"] = True
+                        detectors[det_name]["count"] += 1
+                        if time_str:
+                            detectors[det_name]["last_seen"] = time_str
+        except (OSError, PermissionError):
+            pass
+
+    # Determine overall severity (highest active)
+    severity_rank = {"critical": 3, "warning": 2, "info": 1, "none": 0}
+    overall_severity = "none"
+    for det in detectors.values():
+        if det["active"]:
+            sev = det["severity"]
+            if severity_rank.get(sev, 0) > severity_rank.get(overall_severity, 0):
+                overall_severity = sev
+
+    result = {
+        "active_sessions": active_sessions,
+        "detectors": detectors,
+        "overall_severity": overall_severity,
+    }
+    # Use a custom TTL — store with timestamp key trick via direct cache manipulation
+    _cache["sidecar_status"] = result
+    _cache_ts["sidecar_status"] = time.time() - (_CACHE_TTL_SECONDS - _SIDECAR_CACHE_TTL)
+    return result
