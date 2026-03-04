@@ -8,6 +8,7 @@ Performance: Fixed label widgets (no rebuild), separate timers for Hub/Monitor,
 data fetching via GLib.idle_add for non-blocking UI.
 """
 
+import shutil
 import subprocess
 from pathlib import Path
 import gi
@@ -32,6 +33,7 @@ from monitor import (
     get_usage_timeline,
     get_provider_costs,
     get_anthropic_session_cost,
+    get_skill_usage,
     format_cost,
 )
 from log_viewer import build_logs_tab, refresh_logs
@@ -477,6 +479,7 @@ class ControlPanel(Gtk.Window):
             ("Skills", "claude-skill-ecosystem.html"),
             ("Kosten", "claude-cost-dashboard.html"),
             ("Oktopus", "oktopus-visual.html"),
+            ("UX Guide", "panel-ux-guide.html"),
         ]
         _DIAGRAMS_DIR = str(Path.home() / ".agent" / "diagrams")
         for label, filename in _DIAGRAMS:
@@ -674,6 +677,46 @@ class ControlPanel(Gtk.Window):
             expander.add(skill_grid)
             vbox.pack_start(expander, False, False, 0)
 
+        # --- Archived Skills (from commands-archive/) ---
+        archive_dir = Path.home() / ".claude" / "commands-archive"
+        commands_dir = Path.home() / ".claude" / "commands"
+        archived = sorted(
+            f for f in archive_dir.glob("*.md")
+            if f.name != "INDEX.md"
+        ) if archive_dir.exists() else []
+
+        if archived:
+            archive_exp = Gtk.Expander(
+                label=f"  Archiviert  ({len(archived)} Skills)"
+            )
+            archive_exp.set_margin_start(4)
+
+            archive_grid = Gtk.Grid()
+            archive_grid.set_column_spacing(12)
+            archive_grid.set_row_spacing(4)
+            archive_grid.set_margin_top(6)
+            archive_grid.set_margin_bottom(6)
+            archive_grid.set_margin_start(16)
+
+            for i, skill_file in enumerate(archived):
+                name = skill_file.stem
+                is_active = (commands_dir / f"{name}.md").exists()
+
+                name_lbl = Gtk.Label(label=f"/{name}", xalign=0)
+                name_lbl.set_width_chars(18)
+                archive_grid.attach(name_lbl, 0, i, 1, 1)
+
+                btn = Gtk.Button(label="Aktiv" if is_active else "Aktivieren")
+                btn.set_sensitive(not is_active)
+                btn.connect(
+                    "clicked", self._activate_archived_skill,
+                    name, archive_dir, commands_dir,
+                )
+                archive_grid.attach(btn, 1, i, 1, 1)
+
+            archive_exp.add(archive_grid)
+            vbox.pack_start(archive_exp, False, False, 0)
+
         # --- Missed Skills Today ---
         missed_label = Gtk.Label(label="Verpasste Skills (heute)", xalign=0)
         missed_label.get_style_context().add_class("section-title")
@@ -687,6 +730,15 @@ class ControlPanel(Gtk.Window):
         self.notebook.append_page(scrolled, Gtk.Label(label="Hub"))
 
         idle_once(self._refresh_hub)
+
+    def _activate_archived_skill(self, button, name, archive_dir, commands_dir):
+        """Copy a skill from commands-archive/ to commands/ to activate it."""
+        src = archive_dir / f"{name}.md"
+        dst = commands_dir / f"{name}.md"
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+            button.set_label("Aktiviert!")
+            button.set_sensitive(False)
 
     def _refresh_hub(self) -> bool:
         """Refresh hub tab data. Updates fixed labels — no widget rebuild."""
@@ -903,7 +955,7 @@ class ControlPanel(Gtk.Window):
 
         mcp_servers = self.settings.get("mcpServers", {})
         self.mcp_switches = {}
-        for server_name in ["opencode", "gemini", "filesystem", "memory", "github"]:
+        for server_name in ["opencode", "gemini", "voicemode"]:
             grid.attach(self._label(f"  {server_name}"), 0, row, 1, 1)
             sw = Gtk.Switch()
             sw.set_active(server_name in mcp_servers)
@@ -1204,7 +1256,9 @@ class ControlPanel(Gtk.Window):
 
         self._cost_provider_slots = {}
         provider_meta = [
-            ("anthropic", "#89b4fa", "Claude (Opus/Sonnet/Haiku)"),
+            ("opus", "#89b4fa", "Claude Opus 4.6 ($5/$6.25/$0.50/$25)"),
+            ("sonnet", "#b4befe", "Claude Sonnet 4.6 ($3/$3.75/$0.30/$15)"),
+            ("haiku", "#94e2d5", "Claude Haiku 4.5 ($1/$1.25/$0.10/$5)"),
             ("minimax", "#a6e3a1", "MiniMax M2.5 (~$0.05/1M)"),
             ("codex", "#fab387", "Codex/OpenCode (~$0.10/1M)"),
             ("gemini", "#f9e2af", "Gemini Flash (~$0.10/1M)"),
@@ -1271,6 +1325,44 @@ class ControlPanel(Gtk.Window):
         stats_frame.add(stats_inner)
         vbox.pack_start(stats_frame, False, False, 0)
 
+        # --- Skill Usage ---
+        skill_frame = Gtk.Frame(label="  Skill-Nutzung  ")
+        self.skill_usage_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.skill_usage_box.set_margin_top(8)
+        self.skill_usage_box.set_margin_bottom(8)
+        self.skill_usage_box.set_margin_start(12)
+        self.skill_usage_box.set_margin_end(12)
+
+        _MAX_SKILL_ROWS = 8
+        self._skill_slots = []
+        for _ in range(_MAX_SKILL_ROWS):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            name_lbl = Gtk.Label(label="", xalign=0)
+            name_lbl.set_width_chars(18)
+            row.pack_start(name_lbl, False, False, 0)
+
+            today_lbl = Gtk.Label(label="", xalign=1)
+            today_lbl.set_width_chars(12)
+            row.pack_start(today_lbl, True, True, 0)
+
+            week_lbl = Gtk.Label(label="", xalign=1)
+            week_lbl.set_width_chars(10)
+            week_lbl.set_opacity(0.6)
+            row.pack_start(week_lbl, False, False, 0)
+
+            self.skill_usage_box.pack_start(row, False, False, 0)
+            row.set_no_show_all(True)
+            self._skill_slots.append({
+                "row": row, "name": name_lbl, "today": today_lbl, "week": week_lbl,
+            })
+
+        self.skill_no_data_label = Gtk.Label(label="Keine Skills genutzt")
+        self.skill_no_data_label.set_opacity(0.4)
+        self.skill_usage_box.pack_start(self.skill_no_data_label, False, False, 4)
+
+        skill_frame.add(self.skill_usage_box)
+        vbox.pack_start(skill_frame, False, False, 0)
+
         # --- 7-Day Timeline ---
         timeline_frame = Gtk.Frame(label="  Letzte 7 Tage  ")
         self.cost_timeline_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -1325,8 +1417,10 @@ class ControlPanel(Gtk.Window):
             provider_costs = get_provider_costs()
             total_p = sum(provider_costs.values()) or 0.001
             anthropic_data = get_anthropic_session_cost()
+            anthropic_models = anthropic_data.get("models", {})
             # Providers with estimated costs get "~" prefix
             estimated_providers = {"codex", "gemini"}
+            model_tiers = {"opus", "sonnet", "haiku"}
 
             for name, slot in self._cost_provider_slots.items():
                 cost = provider_costs.get(name, 0.0)
@@ -1337,17 +1431,54 @@ class ControlPanel(Gtk.Window):
                         f'<span foreground="{slot["color"]}">{"\u2588" * bar_len}</span>'
                     )
                     prefix = "~" if name in estimated_providers else ""
-                    if name == "anthropic" and anthropic_data["sessions"] > 0:
-                        inp_k = anthropic_data["input_tokens"] / 1000
-                        out_k = anthropic_data["output_tokens"] / 1000
+                    if name in model_tiers and name in anthropic_models:
+                        md = anthropic_models[name]
+                        inp_k = md.get("input_tokens", 0) / 1000
+                        cache_k = md.get("cache_read_tokens", 0) / 1000
+                        out_k = md.get("output_tokens", 0) / 1000
                         slot["cost"].set_text(
-                            f"${cost:.4f} ({inp_k:.0f}K in / {out_k:.0f}K out)"
+                            f"${cost:.2f} ({inp_k:.0f}K in / {cache_k:.0f}K cache / {out_k:.0f}K out)"
                         )
                     else:
                         slot["cost"].set_text(f"{prefix}${cost:.4f} ({pct:.0f}%)")
                 else:
                     slot["bar"].set_text("")
                     slot["cost"].set_text("—")
+
+            # Skill usage — today + weekly totals
+            today_str = __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).strftime("%Y-%m-%d")
+            skills_today = get_skill_usage(days=1).get(today_str, {})
+            skills_week = get_skill_usage(days=7)
+
+            # Aggregate weekly totals per skill
+            week_totals: dict[str, int] = {}
+            for day_skills in skills_week.values():
+                for sk, cnt in day_skills.items():
+                    week_totals[sk] = week_totals.get(sk, 0) + cnt
+
+            # Sort by today's count (desc), then by weekly count
+            all_skills = sorted(
+                set(skills_today) | set(week_totals),
+                key=lambda s: (skills_today.get(s, 0), week_totals.get(s, 0)),
+                reverse=True,
+            )
+
+            has_skills = bool(all_skills)
+            self.skill_no_data_label.set_visible(not has_skills)
+
+            for i, slot in enumerate(self._skill_slots):
+                if i < len(all_skills):
+                    sk = all_skills[i]
+                    t_cnt = skills_today.get(sk, 0)
+                    w_cnt = week_totals.get(sk, 0)
+                    slot["name"].set_markup(f'<span foreground="#cba6f7"><b>/{sk}</b></span>')
+                    slot["today"].set_text(f"{t_cnt}x heute" if t_cnt > 0 else "—")
+                    slot["week"].set_text(f"{w_cnt}x/Wo")
+                    slot["row"].show_all()
+                else:
+                    slot["row"].hide()
 
             # Timeline — token-based costs
             timeline = get_usage_timeline()
