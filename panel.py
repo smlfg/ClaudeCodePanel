@@ -491,7 +491,7 @@ class ControlPanel(Gtk.Window):
         watcher_grid.set_margin_end(10)
 
         # Detector grid layout: (name, abbrev, row, col)
-        _DETECTOR_LAYOUT = [
+        detector_layout = [
             ("ERROR-CASCADE", "ERR-CASC", 0, 0),
             ("YOLO",          "YOLO",     0, 1),
             ("THRASH",        "THRSH",    0, 2),
@@ -504,7 +504,7 @@ class ControlPanel(Gtk.Window):
         ]
 
         self._watcher_slots = {}
-        for det_name, abbrev, row_idx, col_idx in _DETECTOR_LAYOUT:
+        for det_name, abbrev, row_idx, col_idx in detector_layout:
             cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
 
             dot = Gtk.Label(label="\u25CF")

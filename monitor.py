@@ -661,12 +661,7 @@ def get_sidecar_status() -> dict:
         return cached
 
     # Count active sidecar session files
-    sidecar_files = sorted(
-        Path("/tmp").glob("sidecar-*.json"),
-        key=lambda f: f.stat().st_mtime if f.exists() else 0,
-        reverse=True,
-    )
-    active_sessions = len(sidecar_files)
+    active_sessions = sum(1 for _ in Path("/tmp").glob("sidecar-*.json"))
 
     # Init all detectors as inactive
     detectors: dict[str, dict] = {}
