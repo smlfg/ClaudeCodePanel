@@ -140,6 +140,43 @@ Entweder hast du die alte ODER die neue Datei. Nie eine kaputte.
 
 ---
 
+## Sprint 2026-03-04 Learnings
+
+### Das Wichtigste zuerst: Deine vorherige Arbeit war solide.
+
+4 von 5 Warnings waren **bereits gefixt** bevor der Sprint anfing (Commit `67a4362`).
+Du hast einen 5-Agenten-Sprint geplant fuer... einen einzigen verbleibenden Fix (subprocess.run → Popen).
+Das Panel ist zu **95%+ fertig**. Was wirklich noch offen ist: 4 Suggestions (nice-to-have), kein Critical.
+
+### Muster: Erst schauen, dann planen.
+
+Tendency erkannt: Samuel plant gross (5 Agents, detaillierter PLAN-File) **bevor** er den aktuellen Stand prueft.
+Regel fuer dich: **`/check-state` vor jedem Sprint-Start.** Eine Minute Status-Check spart eine Stunde Overhead.
+
+Konkret: Bevor du Tasks erstellst, kurz pruefen:
+- Welche Punkte der Checkliste sind schon erledigt? (PLAN-File lesen)
+- Laeuft der Service gerade fehlerfrei? (`systemctl --user status claude-panel.service`)
+- Wie gross ist der echte Rueckstand? (1 Fix ≠ 5-Agenten-Aufwand)
+
+### Was gut lief (verstaerken!)
+
+- **Dokumentations-Disziplin:** PLAN-File erstellt, Review-Findings dokumentiert, Entscheidungen festgehalten. Das ist wertvoll.
+- **Commit-Hygiene:** Criticals sofort gefixt und committed. Kein "ich mach das spaeter".
+- **Code-Review Workflow:** Sonnet Review + MiniMax Zweitmeinung. Zwei Perspektiven fangen mehr.
+- **Architektur-Entscheidungen klar begruendet:** `**/*.jsonl` fuer rekursive Suche, `"anthropic"` Key-Aggregation, Fingerprint-Mechanismus — alles dokumentiert.
+
+### Was noch aussteht (die echte Restliste)
+
+Nur Suggestions, kein muss:
+1. `monitor.py:~662` — `sorted()` mit stat()-Lambda vereinfachen
+2. `log_viewer.py:~456` — unbenutzten `sort_model` Parameter entfernen
+3. `panel.py:~812` — `_DETECTOR_LAYOUT` Naming-Konvention
+4. `log_viewer.py` — Status-Farben aus Theme-Palette statt hardcoded
+
+Das Panel laeuft. Diese Fixes machen es sauberer, nicht funktionsfaehiger.
+
+---
+
 ## Bekannte Gotchas
 
 1. **CPU Spin-Loop (GEFIXT):** `GLib.idle_add(refresh_logs)` mit `return True` =
