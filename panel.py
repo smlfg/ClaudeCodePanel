@@ -43,6 +43,7 @@ from process_manager import build_processes_tab, refresh_processes
 from theme import build_css, setup_theme_watcher
 from utils import idle_once
 from swarm_tab import build_swarm_tab, refresh_swarm
+from shortcut_counter_tab import build_shortcut_counter_tab, refresh_shortcut_counter
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +339,7 @@ class ControlPanel(Gtk.Window):
         self.notebook.append_page(build_sessions_tab(), Gtk.Label(label="Sessions"))
         self.notebook.append_page(build_processes_tab(), Gtk.Label(label="Prozesse"))
         self.notebook.append_page(build_swarm_tab(), Gtk.Label(label="Swarm"))
+        self.notebook.append_page(build_shortcut_counter_tab(), Gtk.Label(label="Shortcuts"))
 
         # Bottom status bar
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -371,6 +373,7 @@ class ControlPanel(Gtk.Window):
         GLib.timeout_add_seconds(30, refresh_processes)
         GLib.timeout_add_seconds(30, self._refresh_cost)
         GLib.timeout_add_seconds(30, refresh_swarm)
+        GLib.timeout_add_seconds(30, refresh_shortcut_counter)
 
     def _start_monitor_timer(self) -> bool:
         """One-shot: starts the 30s monitor timer (offset from hub by 15s)."""
@@ -518,11 +521,11 @@ class ControlPanel(Gtk.Window):
         watcher_frame.add(watcher_grid)
         vbox.pack_start(watcher_frame, False, False, 4)
 
-        # Set up Gio.FileMonitor on /tmp for sidecar file changes
+        # Set up Gio.FileMonitor on specific sidecar log file (not whole /tmp)
         self._sidecar_monitor = None
         try:
-            gio_dir = Gio.File.new_for_path("/tmp")
-            self._sidecar_monitor = gio_dir.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            gio_file = Gio.File.new_for_path("/tmp/claude-sidecar.log")
+            self._sidecar_monitor = gio_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
             self._sidecar_monitor.connect("changed", self._on_sidecar_changed)
         except Exception:
             pass
@@ -1694,9 +1697,11 @@ class ControlPanel(Gtk.Window):
 
                 # Sync voicemode systemd service with MCP toggle state
                 if "voicemode" in settings.get("mcpServers", {}):
-                    subprocess.run(["systemctl", "--user", "start", "voicemode-edge-tts"], capture_output=True)
+                    subprocess.Popen(["systemctl", "--user", "start", "voicemode-edge-tts"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif "voicemode" in settings.get("_disabled", {}):
-                    subprocess.run(["systemctl", "--user", "stop", "voicemode-edge-tts"], capture_output=True)
+                    subprocess.Popen(["systemctl", "--user", "stop", "voicemode-edge-tts"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # Hook timeouts and async flags
             for hw in self.hook_widgets:
@@ -1724,18 +1729,18 @@ class ControlPanel(Gtk.Window):
             new_rate = int(self.coaching_adj.get_value())
             write_coaching_rate_limit(new_rate)
 
-            # Voice service
+            # Voice service (fire-and-forget to avoid blocking UI)
             try:
                 if self.voice_switch.get_active():
-                    subprocess.run(
+                    subprocess.Popen(
                         ["systemctl", "--user", "start", "voicemode-edge-tts"],
-                        timeout=5,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
                     self.voice_status.set_text(" Running")
                 else:
-                    subprocess.run(
+                    subprocess.Popen(
                         ["systemctl", "--user", "stop", "voicemode-edge-tts"],
-                        timeout=5,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
                     self.voice_status.set_text(" Stopped")
             except Exception:

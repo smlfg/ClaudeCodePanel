@@ -77,10 +77,13 @@ def _cache_get(key):
     return None
 
 
-def _cache_set(key, value):
-    """Store value in TTL cache."""
+def _cache_set(key, value, ttl=None):
+    """Store value in TTL cache. Optional custom ttl in seconds."""
     _cache[key] = value
-    _cache_ts[key] = time.time()
+    if ttl is not None:
+        _cache_ts[key] = time.time() - (_CACHE_TTL_SECONDS - ttl)
+    else:
+        _cache_ts[key] = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +725,5 @@ def get_sidecar_status() -> dict:
         "detectors": detectors,
         "overall_severity": overall_severity,
     }
-    # Use a custom TTL — store with timestamp key trick via direct cache manipulation
-    _cache["sidecar_status"] = result
-    _cache_ts["sidecar_status"] = time.time() - (_CACHE_TTL_SECONDS - _SIDECAR_CACHE_TTL)
+    _cache_set("sidecar_status", result, ttl=_SIDECAR_CACHE_TTL)
     return result
