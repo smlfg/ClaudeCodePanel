@@ -782,6 +782,9 @@ def build_swarm_tab() -> Gtk.Box:
 
 def refresh_swarm() -> bool:
     """Called by GLib timer from panel.py every 30s."""
+    # Skip if swarm tab is not visible (MiniMax M1 fix)
+    if _stack and not _stack.get_mapped():
+        return True
     try:
         _refresh_content()
         # Also update visual view if visible and ready
