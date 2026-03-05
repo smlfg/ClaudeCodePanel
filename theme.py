@@ -169,6 +169,24 @@ window {{
     background: {p["card"]};
 }}
 
+.session-row-active {{
+    border-left: 3px solid {p["green"]};
+    background: {p["green_hover_bg"]};
+}}
+
+.session-row-active:hover {{
+    background: {p["green_hover_bg"]};
+}}
+
+.session-active-badge {{
+    background: {p["green_hover_bg"]};
+    color: {p["green"]};
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+
 .session-project {{
     font-size: 13px;
     font-weight: bold;

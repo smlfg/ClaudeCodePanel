@@ -187,23 +187,36 @@ def _scan_all_sessions() -> list[dict]:
 # Stats helper
 # ---------------------------------------------------------------------------
 
-def _compute_stats(sessions: list[dict]) -> str:
+def _compute_stats(sessions: list[dict], now: float | None = None) -> str:
     total = len(sessions)
-    now = time.time()
+    if now is None:
+        now = time.time()
+    active = sum(1 for s in sessions if now - s["mtime"] < 120)
     recent = sum(1 for s in sessions if now - s["mtime"] < 3600)
     projects = len({s["project"] for s in sessions})
-    return f"{total} Sessions  |  {recent} in letzter Stunde  |  {projects} Projekte"
+    parts = [f"{total} Sessions"]
+    if active:
+        parts.append(f"{active} aktiv")
+    parts.append(f"{recent} in letzter Stunde")
+    parts.append(f"{projects} Projekte")
+    return "  |  ".join(parts)
 
 
 # ---------------------------------------------------------------------------
 # Row builder
 # ---------------------------------------------------------------------------
 
-def _build_session_row(session: dict) -> Gtk.ListBoxRow:
+def _build_session_row(session: dict, now: float | None = None) -> Gtk.ListBoxRow:
     """Build a single styled ListBoxRow for one session."""
+    if now is None:
+        now = time.time()
     row = Gtk.ListBoxRow()
     row.set_name("session-row")
     row.get_style_context().add_class("session-row")
+
+    is_active = (now - session["mtime"]) < 120  # 2 min
+    if is_active:
+        row.get_style_context().add_class("session-row-active")
 
     # Outer box
     outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -250,6 +263,13 @@ def _build_session_row(session: dict) -> Gtk.ListBoxRow:
     meta_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     meta_box.set_valign(Gtk.Align.CENTER)
     outer.pack_start(meta_box, False, False, 0)
+
+    # "AKTIV" badge for running sessions
+    if is_active:
+        active_label = Gtk.Label(label="AKTIV")
+        active_label.get_style_context().add_class("session-active-badge")
+        active_label.set_halign(Gtk.Align.END)
+        meta_box.pack_start(active_label, False, False, 0)
 
     # Date/time + size — dimmed metadata
     meta_line = Gtk.Label(label=f"{session['time_str']}  {_format_size(session['size'])}")
@@ -333,15 +353,16 @@ def _populate_list_box(sessions: list[dict]) -> None:
         _state["list_box"].remove(child)
 
     # Add rows (up to MAX_SESSIONS)
+    now = time.time()
     for session in sessions[:MAX_SESSIONS]:
-        row = _build_session_row(session)
+        row = _build_session_row(session, now)
         _state["list_box"].add(row)
 
     _state["list_box"].show_all()
 
     # Update stats bar
     if _state["stats_label"] is not None:
-        _state["stats_label"].set_text(_compute_stats(sessions))
+        _state["stats_label"].set_text(_compute_stats(sessions, now))
 
 
 # ---------------------------------------------------------------------------
