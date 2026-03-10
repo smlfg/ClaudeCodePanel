@@ -63,19 +63,20 @@ def _load_rows() -> list[dict]:
         return []
 
 
-def _load_config_combos() -> list[str]:
-    """Load all combos from config.toml. Returns [] on any error."""
+def _load_config() -> dict[str, list[dict]]:
+    """Load shortcut config with descriptions. Returns {} on any error."""
     if not _CONFIG_PATH.exists():
-        return []
+        return {}
     try:
         with open(_CONFIG_PATH, "rb") as f:
             cfg = tomllib.load(f)
-        combos = []
-        for cat in cfg.get("shortcuts", {}).values():
-            combos.extend(cat.get("combos", []))
-        return combos
+        result = {}
+        for cat_name, cat_data in cfg.get("shortcuts", {}).items():
+            items = cat_data.get("items", [])
+            result[cat_name] = [{"combo": it["combo"], "desc": it.get("desc", "")} for it in items]
+        return result
     except Exception:
-        return []
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -112,18 +113,11 @@ def _fmt_last_used(last_used) -> str:
         return str(last_used)[:10]
 
 
-def _find_category(combo: str, _all_combos: list[str]) -> str:
-    """Try to find category for a combo via config.toml."""
-    if not _CONFIG_PATH.exists():
-        return "Sonstige"
-    try:
-        with open(_CONFIG_PATH, "rb") as f:
-            cfg = tomllib.load(f)
-        for cat_name, cat_data in cfg.get("shortcuts", {}).items():
-            if combo in cat_data.get("combos", []):
-                return cat_name
-    except Exception:
-        pass
+def _find_category(combo: str, config: dict[str, list[dict]]) -> str:
+    """Try to find category for a combo via config dict."""
+    for cat_name, items in config.items():
+        if any(it["combo"] == combo for it in items):
+            return cat_name
     return "Sonstige"
 
 
@@ -146,6 +140,17 @@ def _build_shortcut_row(r: dict, p: dict) -> Gtk.Box:
     combo_lbl.set_width_chars(18)
     combo_lbl.set_xalign(0.0)
     row.pack_start(combo_lbl, False, False, 0)
+
+    # Description label (dim, between combo and count)
+    desc = r.get("desc", "")
+    desc_lbl = Gtk.Label()
+    desc_lbl.set_markup(
+        f'<span foreground="{p["dim"]}" size="small">{GLib.markup_escape_text(desc)}</span>'
+    )
+    desc_lbl.set_width_chars(26)
+    desc_lbl.set_xalign(0.0)
+    desc_lbl.set_halign(Gtk.Align.START)
+    row.pack_start(desc_lbl, False, False, 0)
 
     # Count badge (dim text)
     count_lbl = Gtk.Label(label=str(r["count"]))
@@ -197,7 +202,7 @@ def _build_category_card(cat_name: str, cat_rows: list[dict], p: dict) -> Gtk.Bo
     return card
 
 
-def _build_learn_card(combo: str, cat_name: str, p: dict) -> Gtk.Box:
+def _build_learn_card(combo: str, desc: str, cat_name: str, p: dict) -> Gtk.Box:
     """Build a single Learn Next card."""
     card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
     card.get_style_context().add_class("sc-learn-card")
@@ -210,6 +215,15 @@ def _build_learn_card(combo: str, cat_name: str, p: dict) -> Gtk.Box:
     combo_lbl.set_halign(Gtk.Align.START)
     combo_lbl.get_style_context().add_class("section-title")
     card.pack_start(combo_lbl, False, False, 0)
+
+    if desc:
+        desc_lbl = Gtk.Label()
+        desc_lbl.set_markup(
+            f'<span foreground="{p["text"]}" size="small">'
+            f'{GLib.markup_escape_text(desc)}</span>'
+        )
+        desc_lbl.set_halign(Gtk.Align.START)
+        card.pack_start(desc_lbl, False, False, 0)
 
     cat_lbl = Gtk.Label()
     cat_lbl.set_markup(
@@ -229,10 +243,12 @@ def _build_learn_card(combo: str, cat_name: str, p: dict) -> Gtk.Box:
 def _do_refresh() -> bool:
     """Actual UI update — must run on GTK thread. Returns False (one-shot)."""
     rows = _load_rows()
-    config_combos = _load_config_combos()
+    config = _load_config()
     p = get_palette()
 
-    total_config = len(config_combos)
+    # Flat list of all configured items for counting and lookup
+    all_config_items = [it for items in config.values() for it in items]
+    total_config = len(all_config_items)
     used_count = sum(1 for r in rows if r["count"] >= _LEARNING_MIN)
     mastered_count = sum(1 for r in rows if r["count"] >= _MASTERED)
 
@@ -268,21 +284,31 @@ def _do_refresh() -> bool:
         for child in _cards_container.get_children():
             _cards_container.remove(child)
 
-        # Group by category
+        # Build desc lookup: combo -> desc from config
+        desc_lookup: dict[str, str] = {
+            it["combo"]: it["desc"] for it in all_config_items
+        }
+
+        # Group DB rows by category, enriching with desc from config
         categories: dict[str, list[dict]] = {}
         for r in rows:
             cat = r.get("category") or "Sonstige"
-            categories.setdefault(cat, []).append(r)
+            enriched = dict(r)
+            enriched["desc"] = desc_lookup.get(r["combo"], "")
+            categories.setdefault(cat, []).append(enriched)
 
-        # Add config combos never used (not in DB)
+        # Add config items never used (not in DB)
         db_combos = {r["combo"] for r in rows}
-        for combo in config_combos:
-            if combo not in db_combos:
-                cat = _find_category(combo, config_combos)
-                categories.setdefault(cat, []).append({
-                    "combo": combo, "count": 0,
-                    "last_used": None, "category": cat,
-                })
+        for cat_name, items in config.items():
+            for it in items:
+                if it["combo"] not in db_combos:
+                    categories.setdefault(cat_name, []).append({
+                        "combo": it["combo"],
+                        "desc": it["desc"],
+                        "count": 0,
+                        "last_used": None,
+                        "category": cat_name,
+                    })
 
         for cat_name, cat_rows in sorted(categories.items()):
             card = _build_category_card(cat_name, cat_rows, p)
@@ -305,13 +331,16 @@ def _do_refresh() -> bool:
         _learn_box.pack_start(lbl, False, False, 0)
 
         db_combos = {r["combo"] for r in rows}
-        unused = [c for c in config_combos if c not in db_combos or
-                  next((r["count"] for r in rows if r["combo"] == c), 0) == 0]
+        unused = [
+            it for it in all_config_items
+            if it["combo"] not in db_combos
+            or next((r["count"] for r in rows if r["combo"] == it["combo"]), 0) == 0
+        ]
 
         if unused:
-            for combo in unused[:3]:
-                cat = _find_category(combo, config_combos)
-                card = _build_learn_card(combo, cat, p)
+            for it in unused[:3]:
+                cat = _find_category(it["combo"], config)
+                card = _build_learn_card(it["combo"], it["desc"], cat, p)
                 _learn_box.pack_start(card, False, False, 0)
         else:
             done = Gtk.Label()
