@@ -23,6 +23,9 @@ from pathlib import Path
 
 log = logging.getLogger("claude_panel.session_browser")
 
+# Module-level metadata cache: path → (mtime, meta_dict)
+_meta_cache: dict[str, tuple[float, dict]] = {}
+
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -76,33 +79,43 @@ _PREVIEW_SKIP_PREFIXES = (
 def _get_session_meta(path: Path, max_len: int = 120) -> dict:
     """Read metadata from JSONL file: preview text, cwd, slug.
 
-    Quick-parse: reads first 30 + last 10 lines for speed.
+    Uses a module-level mtime cache — unchanged files are never re-read.
+    For files under 512KB: reads all lines ONCE, extracts first 30 + last 10.
+    For large files (>=512KB): reads first 30 lines + subprocess tail for last 10.
     """
+    path_str = str(path)
+    try:
+        stat = path.stat()
+        mtime = stat.st_mtime
+        file_size = stat.st_size
+    except OSError:
+        return {"preview": "(keine Vorschau)", "cwd": "", "slug": ""}
+
+    # Cache hit — file unchanged since last read
+    cached = _meta_cache.get(path_str)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
     slug: str = ""
     cwd: str = ""
     preview: str = ""
 
     try:
-        stat = path.stat()
-        file_size = stat.st_size
-
-        # Read first 30 lines
-        head_lines = []
-        with path.open(encoding="utf-8", errors="replace") as f:
-            for _ in range(30):
-                line = f.readline()
-                if not line:
-                    break
-                head_lines.append(line)
-
-        # Read last 10 lines (for large files, seek from end)
-        tail_lines = []
-        if file_size < 512 * 1024:  # under 512KB — re-read all
+        if file_size < 512 * 1024:
+            # Single read — extract head and tail from the same list
             with path.open(encoding="utf-8", errors="replace") as f:
                 all_lines = f.readlines()
-            if len(all_lines) > 30:
-                tail_lines = all_lines[-10:]
+            head_lines = all_lines[:30]
+            tail_lines = all_lines[-10:] if len(all_lines) > 30 else []
         else:
+            # Large file: read first 30 lines + subprocess tail
+            head_lines = []
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for _ in range(30):
+                    line = f.readline()
+                    if not line:
+                        break
+                    head_lines.append(line)
             try:
                 result = subprocess.run(
                     ["tail", "-n", "10", str(path)],
@@ -175,7 +188,9 @@ def _get_session_meta(path: Path, max_len: int = 120) -> dict:
 
     if not preview:
         preview = slug if slug else "(keine Vorschau)"
-    return {"preview": preview, "cwd": cwd, "slug": slug}
+    result = {"preview": preview, "cwd": cwd, "slug": slug}
+    _meta_cache[path_str] = (mtime, result)
+    return result
 
 
 def _get_session_status(path: Path, mtime: float, now: float) -> str:
@@ -248,59 +263,79 @@ def _get_session_status(path: Path, mtime: float, now: float) -> str:
         return "ready" if age < 120 else "idle"
 
 
+def _build_project_info(path: Path, session_cwd: str) -> tuple[str, str]:
+    """Derive (project_name, short_name) from a session's CWD or parent dir name.
+
+    Shared by _scan_all_sessions() and _grep_sessions() to avoid duplicated logic.
+    Returns (project_name, short_name).
+    """
+    short_name = short_name_from_path(session_cwd)
+    if session_cwd and session_cwd != HOME:
+        project_name = session_cwd.replace(HOME, "~", 1)
+    else:
+        # Fallback: derive project from JSONL parent dir name
+        # e.g. "-home-smlflg-Projekte-ClaudeCodePanel" → "ClaudeCodePanel"
+        dir_name = path.parent.name  # encoded path
+        parts = dir_name.split("-")
+        # Strip leading home-user prefix
+        # "-home-smlflg-Projekte-Foo" → ["", "home", "smlflg", "Projekte", "Foo"]
+        meaningful = [p for p in parts if p and p not in ("home", "smlflg")]
+        if meaningful:
+            short_name = meaningful[-1]
+            project_name = "~/" + "/".join(meaningful)
+        else:
+            project_name = "Home"
+    return project_name, short_name
+
+
 def _scan_all_sessions() -> list[dict]:
-    """Scan ~/.claude/projects/ and return session dicts sorted by mtime desc."""
+    """Scan ~/.claude/projects/ and return session dicts sorted by mtime desc.
+
+    Caps at 200 most-recently-modified JSONL files to bound scan time on
+    large installations (2800+ files). Older sessions remain accessible
+    via fulltext search (_grep_sessions).
+    """
     sessions: list[dict] = []
 
     if not PROJECTS_DIR.exists():
         return sessions
 
-    now = time.time()
+    # Collect all JSONL paths first, then sort by mtime and cap at 200
+    all_files: list[Path] = []
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
         for f in project_dir.glob("*.jsonl"):
-            try:
-                stat = f.stat()
-                meta = _get_session_meta(f)
-                preview = meta["preview"]
-                session_cwd = meta["cwd"]
-                # Use real CWD for short name (preserves umlauts)
-                short_name = short_name_from_path(session_cwd)
-                # Build full project path from CWD for display
-                if session_cwd and session_cwd != HOME:
-                    project_name = session_cwd.replace(HOME, "~", 1)
-                else:
-                    # Fallback: derive project from JSONL parent dir name
-                    # e.g. "-home-smlflg-Projekte-ClaudeCodePanel" → "ClaudeCodePanel"
-                    dir_name = f.parent.name  # encoded path
-                    parts = dir_name.split("-")
-                    # Strip leading home-user prefix
-                    # "-home-smlflg-Projekte-Foo" → ["", "home", "smlflg", "Projekte", "Foo"]
-                    meaningful = [p for p in parts if p and p not in ("home", "smlflg")]
-                    if meaningful:
-                        short_name = meaningful[-1]
-                        project_name = "~/" + "/".join(meaningful)
-                    else:
-                        project_name = "Home"
-                status = _get_session_status(f, stat.st_mtime, now)
-                sessions.append(
-                    {
-                        "path": str(f),
-                        "project": project_name,
-                        "short_name": short_name,
-                        "session_id": f.stem,
-                        "mtime": stat.st_mtime,
-                        "size": stat.st_size,
-                        "time_str": datetime.fromtimestamp(stat.st_mtime).strftime(
-                            "%d.%m %H:%M"
-                        ),
-                        "preview": preview,
-                        "status": status,
-                    }
-                )
-            except (OSError, PermissionError):
-                continue
+            all_files.append(f)
+
+    # Sort newest-first and limit to 200 — avoids scanning all 2800+ files
+    all_files = sorted(all_files, key=lambda p: p.stat().st_mtime, reverse=True)[:200]
+
+    now = time.time()
+    for f in all_files:
+        try:
+            stat = f.stat()
+            meta = _get_session_meta(f)
+            project_name, short_name = _build_project_info(f, meta["cwd"])
+            status = _get_session_status(f, stat.st_mtime, now)
+            sessions.append(
+                {
+                    "path": str(f),
+                    "project": project_name,
+                    "short_name": short_name,
+                    "session_id": f.stem,
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "time_str": datetime.fromtimestamp(stat.st_mtime).strftime(
+                        "%d.%m %H:%M"
+                    ),
+                    "preview": meta["preview"],
+                    "slug": meta["slug"],
+                    "status": status,
+                }
+            )
+        except (OSError, PermissionError):
+            continue
 
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions
@@ -366,21 +401,7 @@ def _grep_sessions(query: str) -> list[dict]:
         try:
             stat = path.stat()
             meta = _get_session_meta(path)
-            session_cwd = meta["cwd"]
-            short_name = short_name_from_path(session_cwd)
-
-            if session_cwd and session_cwd != HOME:
-                project_name = session_cwd.replace(HOME, "~", 1)
-            else:
-                dir_name = path.parent.name
-                parts = dir_name.split("-")
-                meaningful = [p for p in parts if p and p not in ("home", "smlflg")]
-                if meaningful:
-                    short_name = meaningful[-1]
-                    project_name = "~/" + "/".join(meaningful)
-                else:
-                    project_name = "Home"
-
+            project_name, short_name = _build_project_info(path, meta["cwd"])
             status = _get_session_status(path, stat.st_mtime, now)
 
             sessions.append({
@@ -519,6 +540,24 @@ def _build_session_row(session: dict, now: float | None = None) -> Gtk.ListBoxRo
     name_label.set_max_width_chars(45)
     name_label.get_style_context().add_class("session-project")
     info_box.pack_start(name_label, False, False, 0)
+
+    # Subtitle: slug (e.g. "Wild Crafting Sutton") or first 80 chars of preview
+    raw_slug = session.get("slug", "")
+    if raw_slug:
+        subtitle_text = raw_slug.replace("-", " ").title()
+    else:
+        raw_preview = session.get("preview", "")
+        subtitle_text = raw_preview[:80] + ("…" if len(raw_preview) > 80 else "")
+    if subtitle_text:
+        subtitle_label = Gtk.Label(label=subtitle_text)
+        subtitle_label.set_halign(Gtk.Align.START)
+        subtitle_label.set_ellipsize(Pango.EllipsizeMode.END)
+        subtitle_label.set_max_width_chars(70)
+        subtitle_label.get_style_context().add_class("session-meta")
+        subtitle_attrs = Pango.AttrList()
+        subtitle_attrs.insert(Pango.attr_scale_new(0.88))
+        subtitle_label.set_attributes(subtitle_attrs)
+        info_box.pack_start(subtitle_label, False, False, 0)
 
     # Preview — Subtext1 for better contrast
     preview_label = Gtk.Label(label=session["preview"])
