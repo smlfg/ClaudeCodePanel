@@ -8,10 +8,18 @@ Performance: Fixed label widgets (no rebuild), separate timers for Hub/Monitor,
 data fetching via GLib.idle_add for non-blocking UI.
 """
 
+import logging
 import shutil
 import subprocess
 from pathlib import Path
 import gi
+
+logging.basicConfig(
+    filename=str(Path.home() / ".cache" / "claude-panel.log"),
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("claude_panel")
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
@@ -38,12 +46,14 @@ from monitor import (
     format_cost,
 )
 from log_viewer import build_logs_tab, refresh_logs
-from session_browser import build_sessions_tab, refresh_sessions
+from session_browser import build_sessions_tab, refresh_sessions, _scan_all_sessions
 from process_manager import build_processes_tab, refresh_processes
 from theme import build_css, setup_theme_watcher
 from utils import idle_once
 from swarm_tab import build_swarm_tab, refresh_swarm
 from shortcut_counter_tab import build_shortcut_counter_tab, refresh_shortcut_counter
+from project_dashboard_tab import build_project_dashboard_tab, refresh_project_dashboard
+from event_tab import build_events_tab, refresh_events
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +350,8 @@ class ControlPanel(Gtk.Window):
         self.notebook.append_page(build_processes_tab(), Gtk.Label(label="Prozesse"))
         self.notebook.append_page(build_swarm_tab(), Gtk.Label(label="Swarm"))
         self.notebook.append_page(build_shortcut_counter_tab(), Gtk.Label(label="Shortcuts"))
+        self.notebook.append_page(build_project_dashboard_tab(), Gtk.Label(label="Projekte"))
+        self.notebook.append_page(build_events_tab(), Gtk.Label(label="Events"))
 
         # Bottom status bar
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -369,11 +381,13 @@ class ControlPanel(Gtk.Window):
         GLib.timeout_add_seconds(30, self._refresh_hub)
         GLib.timeout_add_seconds(15, self._start_monitor_timer)
         GLib.timeout_add_seconds(10, refresh_logs)
-        GLib.timeout_add_seconds(60, refresh_sessions)
+        GLib.timeout_add_seconds(15, refresh_sessions)
         GLib.timeout_add_seconds(30, refresh_processes)
         GLib.timeout_add_seconds(30, self._refresh_cost)
         GLib.timeout_add_seconds(30, refresh_swarm)
         GLib.timeout_add_seconds(30, refresh_shortcut_counter)
+        GLib.timeout_add_seconds(30, refresh_project_dashboard)
+        GLib.timeout_add_seconds(2, refresh_events)
 
     def _start_monitor_timer(self) -> bool:
         """One-shot: starts the 30s monitor timer (offset from hub by 15s)."""
@@ -528,7 +542,7 @@ class ControlPanel(Gtk.Window):
             self._sidecar_monitor = gio_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
             self._sidecar_monitor.connect("changed", self._on_sidecar_changed)
         except Exception:
-            pass
+            log.exception("sidecar file monitor setup")
 
         # --- Diagrams (compact chip-style FlowBox) ---
         diagrams_label = Gtk.Label(label="Diagramme", xalign=0)
@@ -639,7 +653,7 @@ class ControlPanel(Gtk.Window):
                 icon = Gtk.Image.new_from_icon_name(sc["icon"], Gtk.IconSize.LARGE_TOOLBAR)
                 btn_box.pack_start(icon, False, False, 0)
             except Exception:
-                pass
+                log.exception("icon loading")
 
             lbl = Gtk.Label(label=sc["label"])
             lbl.set_ellipsize(Pango.EllipsizeMode.END)
@@ -894,7 +908,7 @@ class ControlPanel(Gtk.Window):
             sidecar = get_sidecar_status()
             self._update_watcher(sidecar)
         except Exception:
-            pass  # keep timer alive
+            log.exception("refresh hub")
         return True  # keep 30s timer alive
 
     def _update_watcher(self, data: dict) -> None:
@@ -942,7 +956,7 @@ class ControlPanel(Gtk.Window):
         try:
             self._update_watcher(get_sidecar_status())
         except Exception:
-            pass
+            log.exception("idle watcher")
         return False  # one-shot
 
     # -----------------------------------------------------------------------
@@ -1052,6 +1066,7 @@ class ControlPanel(Gtk.Window):
             )
             self.voice_switch.set_active(result.stdout.strip() == "active")
         except Exception:
+            log.exception("voice switch init")
             self.voice_switch.set_active(False)
         voice_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         voice_box.pack_start(self.voice_switch, False, False, 0)
@@ -1341,7 +1356,7 @@ class ControlPanel(Gtk.Window):
             else:
                 self.skills_label.set_text("Keine verpassten Skills heute")
         except Exception:
-            pass  # keep timer alive
+            log.exception("skills label refresh")
         return True  # keep 30s timer alive
 
     # -----------------------------------------------------------------------
@@ -1620,7 +1635,7 @@ class ControlPanel(Gtk.Window):
                 else:
                     slot["row"].hide()
         except Exception:
-            pass
+            log.exception("monitor slot visibility")
         return True
 
     # -----------------------------------------------------------------------
@@ -1744,11 +1759,12 @@ class ControlPanel(Gtk.Window):
                     )
                     self.voice_status.set_text(" Stopped")
             except Exception:
-                pass
+                log.exception("voice stop")
 
             self._set_status("Gespeichert!", "status-saved")
 
         except Exception as e:
+            log.exception("save handler")
             self._set_status(f"Fehler: {e}", "status-error")
 
     def on_reset(self, _button):
@@ -1848,9 +1864,19 @@ def _build_tray_indicator(win: ControlPanel) -> AyatanaAppIndicator3.Indicator:
     item_cost.set_sensitive(False)
     menu.append(item_cost)
 
-    item_sessions = Gtk.MenuItem(label="Aktive Sessions: ...")
-    item_sessions.set_sensitive(False)
-    menu.append(item_sessions)
+    item_sessions_summary = Gtk.MenuItem(label="Sessions: ...")
+    item_sessions_summary.set_sensitive(False)
+    menu.append(item_sessions_summary)
+
+    # Dynamic per-session items (max 5)
+    session_items: list[Gtk.MenuItem] = []
+    for _ in range(5):
+        item = Gtk.MenuItem(label="")
+        item.set_sensitive(False)
+        item.set_no_show_all(True)
+        item.hide()
+        menu.append(item)
+        session_items.append(item)
 
     menu.append(Gtk.SeparatorMenuItem())
 
@@ -1894,6 +1920,40 @@ def _build_tray_indicator(win: ControlPanel) -> AyatanaAppIndicator3.Indicator:
     menu.show_all()
     indicator.set_menu(menu)
 
+    def _update_session_menu_items(sessions: list[dict]) -> None:
+        """Update the per-session menu items and summary."""
+        active = [s for s in sessions if s.get("status") in ("working", "ready")]
+        working = sum(1 for s in active if s["status"] == "working")
+        ready = sum(1 for s in active if s["status"] == "ready")
+
+        # Summary line
+        if active:
+            parts = []
+            if working:
+                parts.append(f"{working} arbeitet")
+            if ready:
+                parts.append(f"{ready} bereit")
+            item_sessions_summary.set_label("Sessions: " + " / ".join(parts))
+        else:
+            item_sessions_summary.set_label("Sessions: keine aktiv")
+
+        # Per-session items
+        for i, item in enumerate(session_items):
+            if i < len(active):
+                s = active[i]
+                emoji = "\u25cf" if s["status"] == "working" else "\u25cb"
+                status_text = "ARBEITET" if s["status"] == "working" else "BEREIT"
+                item.set_label(f"  {emoji} {s['short_name']} \u2014 {status_text}")
+                item.show()
+            else:
+                item.hide()
+
+        # Tray label: compact "XW/YB"
+        if working or ready:
+            indicator.set_label(f"{working}W/{ready}B", "")
+        else:
+            indicator.set_label("", "")
+
     # On menu show: auto-show window + refresh stats (1-click UX)
     def _on_menu_show(_menu):
         if not win.get_visible():
@@ -1906,10 +1966,25 @@ def _build_tray_indicator(win: ControlPanel) -> AyatanaAppIndicator3.Indicator:
             )
         else:
             item_cost.set_label("Kosten heute: N/A")
-        active = get_active_sessions()
-        item_sessions.set_label(f"Aktive Sessions: {len(active)}")
+        # Refresh session status on menu open
+        try:
+            sessions = _scan_all_sessions()
+            _update_session_menu_items(sessions)
+        except Exception:
+            log.exception("tray menu show")
 
     menu.connect("show", _on_menu_show)
+
+    # Periodic tray status refresh (every 15s)
+    def _refresh_tray_status() -> bool:
+        try:
+            sessions = _scan_all_sessions()
+            _update_session_menu_items(sessions)
+        except Exception:
+            log.exception("tray session refresh")
+        return True  # keep timer alive
+
+    GLib.timeout_add_seconds(15, _refresh_tray_status)
 
     return indicator
 

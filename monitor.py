@@ -10,10 +10,13 @@ Session previews cached permanently (content never changes).
 
 import importlib.util
 import json
+import logging
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger("claude_panel.monitor")
 
 
 def _load_usage_reader():
@@ -48,14 +51,14 @@ try:
     _usage_reader_mod = _load_usage_reader()
     _HAS_USAGE_READER = _usage_reader_mod is not None
 except Exception:
-    _HAS_USAGE_READER = False
+    log.warning("usage_reader not available"); _HAS_USAGE_READER = False
 
 _skill_tracker_mod = None
 try:
     _skill_tracker_mod = _load_skill_tracker()
     _HAS_SKILL_TRACKER = _skill_tracker_mod is not None
 except Exception:
-    _HAS_SKILL_TRACKER = False
+    log.warning("skill_tracker not available"); _HAS_SKILL_TRACKER = False
 
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -308,6 +311,7 @@ def _get_tool_call_stats() -> dict:
             "unique_tools": summary.get("unique_tools", 0),
         }
     except Exception:
+        log.exception("get_skill_usage")
         return {"total_calls": 0, "unique_tools": 0}
 
 
@@ -343,6 +347,7 @@ def get_top_tools(n: int = 5) -> list[tuple[str, int]]:
     try:
         result = _usage_reader_mod.get_top_n(n)
     except Exception:
+        log.exception("get_top_tools")
         result = []
     _cache_set(f"top_tools_{n}", result)
     return result
@@ -495,6 +500,7 @@ def get_missed_skills() -> list[dict]:
     try:
         return _skill_tracker_mod.get_missed_today()
     except Exception:
+        log.exception("get_missed_skills_summary")
         return []
 
 

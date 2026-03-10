@@ -12,12 +12,15 @@ Provides build_processes_tab() returning a Gtk.ScrolledWindow with:
 Theme: Catppuccin Mocha (dark) / Latte (light) via theme.py
 """
 
+import logging
 import os
 import signal
 import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger("claude_panel.process_manager")
 
 import gi
 
@@ -476,8 +479,8 @@ def refresh_processes() -> bool:
     try:
         processes = _scan_processes()
         GLib.idle_add(_populate_list_box, processes)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:
+        log.exception("refresh processes")
     return True  # keep timer running
 
 

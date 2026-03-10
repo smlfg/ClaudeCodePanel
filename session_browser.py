@@ -11,12 +11,17 @@ Provides build_sessions_tab() returning a Gtk.ScrolledWindow with:
 Theme: Catppuccin Mocha (dark) / Latte (light) via theme.py
 """
 
+import html as html_mod
 import json
+import logging
+import re
 import shlex
 import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger("claude_panel.session_browser")
 
 import gi
 
@@ -29,7 +34,6 @@ from utils import idle_once, short_name_from_path, HOME
 # Constants
 # ---------------------------------------------------------------------------
 PROJECTS_DIR = Path(HOME) / ".claude" / "projects"
-MAX_SESSIONS = 20
 
 # Colors are handled by CSS classes defined in theme.py
 
@@ -42,6 +46,9 @@ _state: dict = {
     "stats_label": None,    # Gtk.Label | None
     "search_entry": None,   # Gtk.SearchEntry | None
     "all_sessions": [],     # list[dict]
+    "search_mode": False,   # True when in grep search mode
+    "debounce_id": None,    # GLib timeout source ID for debounce
+    "batch_id": None,       # GLib idle source ID for batch insertion
 }
 
 
@@ -61,82 +68,184 @@ def _format_size(size_bytes: int) -> str:
 _PREVIEW_SKIP_PREFIXES = (
     "[Request interrupted",
     "Implement the following plan",
+    "<local-command-caveat>",
+    "<command-name>",
 )
 
 
-def _get_session_meta(path: Path, max_len: int = 60) -> dict:
+def _get_session_meta(path: Path, max_len: int = 120) -> dict:
     """Read metadata from JSONL file: preview text, cwd, slug.
 
-    Skips junk messages like '[Request interrupted by user for tool use]'
-    and 'Implement the following plan:'.  For plan messages, extracts the
-    plan title (the first '# ...' heading).  Falls back to the session slug.
+    Quick-parse: reads first 30 + last 10 lines for speed.
     """
     slug: str = ""
     cwd: str = ""
     preview: str = ""
-    lines_read = 0
-    max_lines = 80  # scan deeper — real messages can be far down after compression
+
     try:
+        stat = path.stat()
+        file_size = stat.st_size
+
+        # Read first 30 lines
+        head_lines = []
         with path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                lines_read += 1
-                if lines_read > max_lines:
-                    break
-                line = line.strip()
+            for _ in range(30):
+                line = f.readline()
                 if not line:
+                    break
+                head_lines.append(line)
+
+        # Read last 10 lines (for large files, seek from end)
+        tail_lines = []
+        if file_size < 512 * 1024:  # under 512KB — re-read all
+            with path.open(encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+            if len(all_lines) > 30:
+                tail_lines = all_lines[-10:]
+        else:
+            try:
+                result = subprocess.run(
+                    ["tail", "-n", "10", str(path)],
+                    capture_output=True, text=True, timeout=2
+                )
+                tail_lines = result.stdout.splitlines(keepends=True)
+            except (subprocess.TimeoutExpired, OSError):
+                tail_lines = []
+
+        all_sample = head_lines + tail_lines
+
+        for line in all_sample:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if not slug and entry.get("slug"):
+                slug = entry["slug"]
+            if not cwd and entry.get("cwd"):
+                cwd = entry["cwd"]
+
+            if preview:
+                if cwd and slug:
+                    break
+                continue
+
+            if entry.get("type") != "user":
+                continue
+
+            msg = entry.get("message", {})
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_blocks = [
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and "<local-command-caveat>" not in block.get("text", "")
+                ]
+                if text_blocks:
+                    content = text_blocks[0]
+                else:
                     continue
-                try:
-                    entry = json.loads(line)
-                    # Capture slug and cwd from any entry
-                    if not slug and entry.get("slug"):
-                        slug = entry["slug"]
-                    if not cwd and entry.get("cwd"):
-                        cwd = entry["cwd"]
-                    if preview:
-                        # Already found preview, but keep scanning for cwd/slug
-                        if cwd and slug:
+            if not isinstance(content, str):
+                continue
+            content = content.strip()
+            if any(content.startswith(p) for p in _PREVIEW_SKIP_PREFIXES):
+                if content.startswith("Implement the following plan"):
+                    for plan_line in content.split("\n"):
+                        plan_line = plan_line.strip()
+                        if plan_line.startswith("# "):
+                            title = plan_line[2:].strip()
+                            if title.lower().startswith("plan:"):
+                                title = title[5:].strip()
+                            if len(title) > max_len:
+                                title = title[:max_len] + "..."
+                            preview = title
                             break
-                        continue
-                    if entry.get("type") != "user":
-                        continue
-                    msg = entry.get("message", {})
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                content = block.get("text", "")
-                                break
-                        else:
-                            content = str(content)
-                    if not isinstance(content, str):
-                        continue
-                    content = content.strip()
-                    # Skip junk messages
-                    if any(content.startswith(p) for p in _PREVIEW_SKIP_PREFIXES):
-                        # For plan messages, try to extract the title
-                        if content.startswith("Implement the following plan"):
-                            for plan_line in content.split("\n"):
-                                plan_line = plan_line.strip()
-                                if plan_line.startswith("# "):
-                                    title = plan_line[2:].strip()
-                                    if title.lower().startswith("plan:"):
-                                        title = title[5:].strip()
-                                    if len(title) > max_len:
-                                        title = title[:max_len] + "..."
-                                    preview = title
-                                    break
-                        continue
-                    first_line = content.split("\n")[0]
-                    if len(first_line) > max_len:
-                        first_line = first_line[:max_len] + "..."
-                    preview = first_line
-                except json.JSONDecodeError:
-                    continue
+                continue
+            first_line = content.split("\n")[0]
+            if len(first_line) > max_len:
+                first_line = first_line[:max_len] + "..."
+            preview = first_line
     except (OSError, PermissionError):
         pass
+
     if not preview:
         preview = slug if slug else "(keine Vorschau)"
     return {"preview": preview, "cwd": cwd, "slug": slug}
+
+
+def _get_session_status(path: Path, mtime: float, now: float) -> str:
+    """Determine session status from last JSONL entry.
+
+    Returns:
+        "working"  — Claude is actively processing (last entry is tool_use or user msg)
+        "ready"    — Claude finished, waiting for user input
+        "idle"     — session not recently active
+    """
+    age = now - mtime
+    if age > 120:
+        return "idle"
+
+    # Read last non-empty line of JSONL (seek from end for speed)
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return "idle"
+        # Read last 4KB — enough for the final JSONL line
+        read_size = min(size, 4096)
+        with path.open("rb") as f:
+            f.seek(-read_size, 2)
+            tail = f.read().decode("utf-8", errors="replace")
+        lines = [l for l in tail.strip().splitlines() if l.strip()]
+        if not lines:
+            return "idle"
+        last_line = lines[-1]
+        try:
+            entry = json.loads(last_line)
+        except json.JSONDecodeError:
+            # If last line is corrupt, check second-to-last
+            if len(lines) >= 2:
+                try:
+                    entry = json.loads(lines[-2])
+                except json.JSONDecodeError:
+                    return "ready" if age < 120 else "idle"
+            else:
+                return "ready" if age < 120 else "idle"
+
+        entry_type = entry.get("type", "")
+        msg = entry.get("message", {})
+
+        # User message → Claude is about to process
+        if entry_type == "user":
+            return "working"
+
+        # Assistant message → check for tool_use (Claude still working)
+        if entry_type == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        return "working"
+            # Check stop_reason — tool_use means Claude wants to call a tool
+            stop = msg.get("stop_reason", "")
+            if stop == "tool_use":
+                return "working"
+            # end_turn or max_tokens → Claude is done
+            return "ready"
+
+        # Tool result → Claude is processing
+        if entry_type == "tool_result":
+            return "working"
+
+        # Fallback: if very recent mtime, likely working
+        return "working" if age < 5 else "ready"
+
+    except (OSError, PermissionError):
+        return "ready" if age < 120 else "idle"
 
 
 def _scan_all_sessions() -> list[dict]:
@@ -146,6 +255,7 @@ def _scan_all_sessions() -> list[dict]:
     if not PROJECTS_DIR.exists():
         return sessions
 
+    now = time.time()
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
@@ -161,7 +271,19 @@ def _scan_all_sessions() -> list[dict]:
                 if session_cwd and session_cwd != HOME:
                     project_name = session_cwd.replace(HOME, "~", 1)
                 else:
-                    project_name = "Home"
+                    # Fallback: derive project from JSONL parent dir name
+                    # e.g. "-home-smlflg-Projekte-ClaudeCodePanel" → "ClaudeCodePanel"
+                    dir_name = f.parent.name  # encoded path
+                    parts = dir_name.split("-")
+                    # Strip leading home-user prefix
+                    # "-home-smlflg-Projekte-Foo" → ["", "home", "smlflg", "Projekte", "Foo"]
+                    meaningful = [p for p in parts if p and p not in ("home", "smlflg")]
+                    if meaningful:
+                        short_name = meaningful[-1]
+                        project_name = "~/" + "/".join(meaningful)
+                    else:
+                        project_name = "Home"
+                status = _get_session_status(f, stat.st_mtime, now)
                 sessions.append(
                     {
                         "path": str(f),
@@ -174,12 +296,165 @@ def _scan_all_sessions() -> list[dict]:
                             "%d.%m %H:%M"
                         ),
                         "preview": preview,
+                        "status": status,
                     }
                 )
             except (OSError, PermissionError):
                 continue
 
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def _grep_sessions(query: str) -> list[dict]:
+    """Fulltext search across all session files using grep -l -i.
+
+    Returns matching session dicts with snippet context.
+    Runs synchronously (~0.3s for 649 files).
+    """
+    if not PROJECTS_DIR.exists():
+        return []
+
+    # Collect all JSONL files
+    all_files = []
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for f in project_dir.glob("*.jsonl"):
+            all_files.append(str(f))
+
+    if not all_files:
+        return []
+
+    # grep -l -i for matching files
+    try:
+        result = subprocess.run(
+            ["grep", "-l", "-i", "--", query] + all_files,
+            capture_output=True, text=True, timeout=10
+        )
+        matching_files = [f for f in result.stdout.splitlines() if f.strip()]
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+
+    if not matching_files:
+        return []
+
+    # Batch grep -c for match counts (one subprocess for all files)
+    counts: dict[str, int] = {}
+    try:
+        count_result = subprocess.run(
+            ["grep", "-i", "-c", "--", query] + matching_files,
+            capture_output=True, text=True, timeout=10
+        )
+        for line in count_result.stdout.splitlines():
+            # Format: filepath:count
+            if ":" in line:
+                fpath, _, cnt = line.rpartition(":")
+                try:
+                    counts[fpath] = int(cnt)
+                except ValueError:
+                    pass
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Build session dicts for matching files
+    now = time.time()
+    query_lower = query.lower()
+    sessions = []
+    for filepath in matching_files:
+        path = Path(filepath)
+        try:
+            stat = path.stat()
+            meta = _get_session_meta(path)
+            session_cwd = meta["cwd"]
+            short_name = short_name_from_path(session_cwd)
+
+            if session_cwd and session_cwd != HOME:
+                project_name = session_cwd.replace(HOME, "~", 1)
+            else:
+                dir_name = path.parent.name
+                parts = dir_name.split("-")
+                meaningful = [p for p in parts if p and p not in ("home", "smlflg")]
+                if meaningful:
+                    short_name = meaningful[-1]
+                    project_name = "~/" + "/".join(meaningful)
+                else:
+                    project_name = "Home"
+
+            status = _get_session_status(path, stat.st_mtime, now)
+
+            sessions.append({
+                "path": filepath,
+                "project": project_name,
+                "short_name": short_name,
+                "session_id": path.stem,
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "time_str": datetime.fromtimestamp(stat.st_mtime).strftime("%d.%m %H:%M"),
+                "preview": meta["preview"],
+                "status": status,
+                "snippet": "",
+                "match_count": counts.get(filepath, 0),
+            })
+        except (OSError, PermissionError):
+            continue
+
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+
+    # Extract snippets: one batched grep -m1 -H for top 50 results
+    top_files = [s["path"] for s in sessions[:50]]
+    if top_files:
+        snippet_map: dict[str, str] = {}
+        try:
+            snip_result = subprocess.run(
+                ["grep", "-i", "-m", "1", "-H", "--", query] + top_files,
+                capture_output=True, text=True, timeout=10
+            )
+            for line in snip_result.stdout.splitlines():
+                # Format: filepath:json_line (split on first : after filepath)
+                # JSONL paths contain no colons, so first : is the separator
+                sep = line.find(".jsonl:")
+                if sep < 0:
+                    continue
+                fpath = line[:sep + 6]  # include ".jsonl"
+                raw = line[sep + 7:]    # skip ":"
+                if fpath not in snippet_map:
+                    snippet_map[fpath] = raw.strip()
+        except (subprocess.TimeoutExpired, OSError):
+            snippet_map = {}
+
+        for session in sessions[:50]:
+            raw = snippet_map.get(session["path"], "")
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+                msg = obj.get("message", {})
+                content = msg.get("content", "") if isinstance(msg, dict) else ""
+                if isinstance(content, list):
+                    texts = [b.get("text", "") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text"]
+                    content = " ".join(texts)
+                if not isinstance(content, str):
+                    content = ""
+                if query_lower not in content.lower():
+                    content = json.dumps(obj, ensure_ascii=False)
+            except (json.JSONDecodeError, AttributeError):
+                content = raw
+            if query_lower in content.lower():
+                idx = content.lower().find(query_lower)
+                start = max(0, idx - 60)
+                end = min(len(content), idx + len(query) + 60)
+                snippet = content[start:end].replace("\n", " ").strip()
+                for char in ('"', '{', '}', '\\'):
+                    snippet = snippet.replace(char, ' ')
+                snippet = " ".join(snippet.split())
+                if start > 0:
+                    snippet = "…" + snippet
+                if end < len(content):
+                    snippet = snippet + "…"
+                session["snippet"] = snippet
+
     return sessions
 
 
@@ -191,12 +466,15 @@ def _compute_stats(sessions: list[dict], now: float | None = None) -> str:
     total = len(sessions)
     if now is None:
         now = time.time()
-    active = sum(1 for s in sessions if now - s["mtime"] < 120)
+    working = sum(1 for s in sessions if s.get("status") == "working")
+    ready = sum(1 for s in sessions if s.get("status") == "ready")
     recent = sum(1 for s in sessions if now - s["mtime"] < 3600)
     projects = len({s["project"] for s in sessions})
     parts = [f"{total} Sessions"]
-    if active:
-        parts.append(f"{active} aktiv")
+    if working:
+        parts.append(f"{working} arbeitet")
+    if ready:
+        parts.append(f"{ready} bereit")
     parts.append(f"{recent} in letzter Stunde")
     parts.append(f"{projects} Projekte")
     return "  |  ".join(parts)
@@ -214,9 +492,12 @@ def _build_session_row(session: dict, now: float | None = None) -> Gtk.ListBoxRo
     row.set_name("session-row")
     row.get_style_context().add_class("session-row")
 
-    is_active = (now - session["mtime"]) < 120  # 2 min
-    if is_active:
-        row.get_style_context().add_class("session-row-active")
+    status = session.get("status", "idle")
+    is_active = status in ("working", "ready")
+    if status == "working":
+        row.get_style_context().add_class("session-row-working")
+    elif status == "ready":
+        row.get_style_context().add_class("session-row-ready")
 
     # Outer box
     outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -243,33 +524,37 @@ def _build_session_row(session: dict, now: float | None = None) -> Gtk.ListBoxRo
     preview_label = Gtk.Label(label=session["preview"])
     preview_label.set_halign(Gtk.Align.START)
     preview_label.set_ellipsize(Pango.EllipsizeMode.END)
-    preview_label.set_max_width_chars(60)
+    preview_label.set_max_width_chars(90)
     preview_label.get_style_context().add_class("session-preview")
     info_box.pack_start(preview_label, False, False, 0)
 
-    # Full project path — dimmed, only if different from short_name
-    if session["project"] != session["short_name"]:
-        path_label = Gtk.Label(label=session["project"])
-        path_label.set_halign(Gtk.Align.START)
-        path_label.set_ellipsize(Pango.EllipsizeMode.END)
-        path_label.set_max_width_chars(60)
-        path_label.get_style_context().add_class("session-meta")
-        path_attrs = Pango.AttrList()
-        path_attrs.insert(Pango.attr_scale_new(0.82))
-        path_label.set_attributes(path_attrs)
-        info_box.pack_start(path_label, False, False, 0)
+    # Project path — always shown for context
+    path_label = Gtk.Label(label=session["project"])
+    path_label.set_halign(Gtk.Align.START)
+    path_label.set_ellipsize(Pango.EllipsizeMode.END)
+    path_label.set_max_width_chars(70)
+    path_label.get_style_context().add_class("session-meta")
+    path_attrs = Pango.AttrList()
+    path_attrs.insert(Pango.attr_scale_new(0.82))
+    path_label.set_attributes(path_attrs)
+    info_box.pack_start(path_label, False, False, 0)
 
     # Right: meta info + resume button
     meta_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     meta_box.set_valign(Gtk.Align.CENTER)
     outer.pack_start(meta_box, False, False, 0)
 
-    # "AKTIV" badge for running sessions
-    if is_active:
-        active_label = Gtk.Label(label="AKTIV")
-        active_label.get_style_context().add_class("session-active-badge")
-        active_label.set_halign(Gtk.Align.END)
-        meta_box.pack_start(active_label, False, False, 0)
+    # Status badge for active sessions
+    if status == "working":
+        badge = Gtk.Label(label="ARBEITET")
+        badge.get_style_context().add_class("session-working-badge")
+        badge.set_halign(Gtk.Align.END)
+        meta_box.pack_start(badge, False, False, 0)
+    elif status == "ready":
+        badge = Gtk.Label(label="BEREIT")
+        badge.get_style_context().add_class("session-ready-badge")
+        badge.set_halign(Gtk.Align.END)
+        meta_box.pack_start(badge, False, False, 0)
 
     # Date/time + size — dimmed metadata
     meta_line = Gtk.Label(label=f"{session['time_str']}  {_format_size(session['size'])}")
@@ -288,6 +573,108 @@ def _build_session_row(session: dict, now: float | None = None) -> Gtk.ListBoxRo
     # Store session data on row for filtering
     row._session_data = session  # type: ignore[attr-defined]
 
+    row.show_all()
+    return row
+
+
+def _build_search_row(session: dict, query: str, now: float | None = None) -> Gtk.ListBoxRow:
+    """Build a ListBoxRow for a search result with snippet + highlighting."""
+    if now is None:
+        now = time.time()
+    row = Gtk.ListBoxRow()
+    row.set_name("session-row")
+    row.get_style_context().add_class("session-row")
+    row.get_style_context().add_class("session-row-search")
+
+    # Outer box
+    outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+    outer.set_margin_top(4)
+    outer.set_margin_bottom(4)
+    outer.set_margin_start(8)
+    outer.set_margin_end(10)
+    row.add(outer)
+
+    # Left: short name + preview + snippet + path
+    info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+    info_box.set_hexpand(True)
+    outer.pack_start(info_box, True, True, 0)
+
+    # Short project name
+    name_label = Gtk.Label(label=session["short_name"])
+    name_label.set_halign(Gtk.Align.START)
+    name_label.set_ellipsize(Pango.EllipsizeMode.END)
+    name_label.set_max_width_chars(45)
+    name_label.get_style_context().add_class("session-project")
+    info_box.pack_start(name_label, False, False, 0)
+
+    # Preview
+    preview_label = Gtk.Label(label=session["preview"])
+    preview_label.set_halign(Gtk.Align.START)
+    preview_label.set_ellipsize(Pango.EllipsizeMode.END)
+    preview_label.set_max_width_chars(90)
+    preview_label.get_style_context().add_class("session-preview")
+    info_box.pack_start(preview_label, False, False, 0)
+
+    # Snippet with Pango markup highlighting
+    snippet = session.get("snippet", "")
+    if snippet and query:
+        # Escape markup characters first, then highlight
+        safe_snippet = html_mod.escape(snippet)
+        safe_query = html_mod.escape(query)
+        # Case-insensitive highlight
+        highlighted = re.sub(
+            re.escape(safe_query),
+            lambda m: f"<b>{m.group()}</b>",
+            safe_snippet,
+            flags=re.IGNORECASE
+        )
+        snippet_label = Gtk.Label()
+        snippet_label.set_markup(highlighted)
+        snippet_label.set_halign(Gtk.Align.START)
+        snippet_label.set_ellipsize(Pango.EllipsizeMode.END)
+        snippet_label.set_max_width_chars(100)
+        snippet_label.get_style_context().add_class("session-snippet")
+        info_box.pack_start(snippet_label, False, False, 0)
+
+    # Project path
+    path_label = Gtk.Label(label=session["project"])
+    path_label.set_halign(Gtk.Align.START)
+    path_label.set_ellipsize(Pango.EllipsizeMode.END)
+    path_label.set_max_width_chars(70)
+    path_label.get_style_context().add_class("session-meta")
+    path_attrs = Pango.AttrList()
+    path_attrs.insert(Pango.attr_scale_new(0.82))
+    path_label.set_attributes(path_attrs)
+    info_box.pack_start(path_label, False, False, 0)
+
+    # Right: match badge + meta + resume button
+    meta_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    meta_box.set_valign(Gtk.Align.CENTER)
+    outer.pack_start(meta_box, False, False, 0)
+
+    # Match count badge
+    match_count = session.get("match_count", 0)
+    if match_count > 0:
+        badge = Gtk.Label(label=f"{match_count} Treffer")
+        badge.get_style_context().add_class("session-match-badge")
+        badge.set_halign(Gtk.Align.END)
+        meta_box.pack_start(badge, False, False, 0)
+
+    # Date/time + size
+    meta_line = Gtk.Label(label=f"{session['time_str']}  {_format_size(session['size'])}")
+    meta_line.set_halign(Gtk.Align.END)
+    meta_line.get_style_context().add_class("session-meta")
+    meta_box.pack_start(meta_line, False, False, 0)
+
+    # Resume button
+    resume_btn = Gtk.Button(label="Resume")
+    resume_btn.set_tooltip_text(f"claude -r {session['session_id']}")
+    resume_btn.get_style_context().add_class("session-resume")
+    session_id = session["session_id"]
+    resume_btn.connect("clicked", _on_resume_clicked, session_id)
+    meta_box.pack_start(resume_btn, False, False, 0)
+
+    row._session_data = session
     row.show_all()
     return row
 
@@ -321,6 +708,8 @@ def _on_resume_clicked(_btn: Gtk.Button, session_id: str) -> None:
 
 def _filter_func(row: Gtk.ListBoxRow) -> bool:
     """Return True if row matches current search query."""
+    if _state["search_mode"]:
+        return True  # grep already filtered — show all rows
     if _state["search_entry"] is None:
         return True
     query = _state["search_entry"].get_text().strip().lower()
@@ -343,6 +732,11 @@ def _filter_func(row: Gtk.ListBoxRow) -> bool:
 
 def _populate_list_box(sessions: list[dict]) -> None:
     """Clear and re-populate the ListBox with new session rows."""
+    # Cancel any running batch insertion from search mode
+    if _state["batch_id"] is not None:
+        GLib.source_remove(_state["batch_id"])
+        _state["batch_id"] = None
+
     _state["all_sessions"] = sessions
 
     if _state["list_box"] is None:
@@ -352,9 +746,9 @@ def _populate_list_box(sessions: list[dict]) -> None:
     for child in _state["list_box"].get_children():
         _state["list_box"].remove(child)
 
-    # Add rows (up to MAX_SESSIONS)
+    # Add all rows
     now = time.time()
-    for session in sessions[:MAX_SESSIONS]:
+    for session in sessions:
         row = _build_session_row(session, now)
         _state["list_box"].add(row)
 
@@ -366,6 +760,91 @@ def _populate_list_box(sessions: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Search logic (debounced, two-mode)
+# ---------------------------------------------------------------------------
+
+def _on_search_changed(_entry: Gtk.SearchEntry) -> None:
+    """Handle search text changes with 300ms debounce."""
+    # Cancel previous debounce timer
+    if _state["debounce_id"] is not None:
+        GLib.source_remove(_state["debounce_id"])
+        _state["debounce_id"] = None
+
+    # Cancel any running batch insertion
+    if _state["batch_id"] is not None:
+        GLib.source_remove(_state["batch_id"])
+        _state["batch_id"] = None
+
+    query = _state["search_entry"].get_text().strip()
+
+    if len(query) < 3:
+        # Short query or empty: switch back to browse mode
+        if _state["search_mode"]:
+            _state["search_mode"] = False
+            _populate_list_box(_state["all_sessions"])
+        else:
+            # Just filter existing rows
+            if _state["list_box"] is not None:
+                _state["list_box"].invalidate_filter()
+        return
+
+    # Debounce: schedule grep search after 300ms
+    _state["debounce_id"] = GLib.timeout_add(300, _execute_search, query)
+
+
+def _execute_search(query: str) -> bool:
+    """Run grep search and populate results in batches. Returns False (one-shot)."""
+    _state["debounce_id"] = None
+    _state["search_mode"] = True
+
+    results = _grep_sessions(query)
+
+    if _state["list_box"] is None:
+        return False
+
+    # Clear existing rows
+    for child in _state["list_box"].get_children():
+        _state["list_box"].remove(child)
+
+    # Update stats immediately (user sees count sofort)
+    if _state["stats_label"] is not None:
+        total_matches = sum(s.get("match_count", 0) for s in results)
+        _state["stats_label"].set_text(
+            f"{len(results)} Sessions gefunden  |  {total_matches} Treffer gesamt  |  Suche: \"{query}\""
+        )
+
+    if not results:
+        _state["list_box"].show_all()
+        return False
+
+    # Cancel any previous batch insertion
+    if _state["batch_id"] is not None:
+        GLib.source_remove(_state["batch_id"])
+        _state["batch_id"] = None
+
+    # Batch-insert via idle_add
+    now = time.time()
+    it = iter(results)
+
+    def _insert_batch() -> bool:
+        BATCH = 30
+        try:
+            for _ in range(BATCH):
+                session = next(it)
+                row = _build_search_row(session, query, now)
+                _state["list_box"].add(row)
+            _state["list_box"].show_all()
+            return True  # more rows pending
+        except StopIteration:
+            _state["list_box"].show_all()
+            _state["batch_id"] = None
+            return False  # done
+
+    _state["batch_id"] = GLib.idle_add(_insert_batch)
+    return False  # one-shot timer
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -374,8 +853,8 @@ def refresh_sessions() -> bool:
     try:
         sessions = _scan_all_sessions()
         GLib.idle_add(_populate_list_box, sessions)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:
+        log.exception("refresh sessions")
     return True  # keep timer running
 
 
@@ -452,7 +931,7 @@ def build_sessions_tab() -> Gtk.ScrolledWindow:
     main_vbox.pack_start(_state["list_box"], True, True, 0)
 
     # Connect search to filter
-    _state["search_entry"].connect("search-changed", lambda _e: _state["list_box"].invalidate_filter())
+    _state["search_entry"].connect("search-changed", _on_search_changed)
 
     # -----------------------------------------------------------------------
     # Initial load (non-blocking via idle_add)
