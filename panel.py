@@ -102,35 +102,6 @@ SHORTCUTS = [
         "command": "xdg-open http://localhost:5111",
         "category": "service",
     },
-    # --- Referenz-Diagramme (Blue — interactive HTML dashboards) ---
-    {
-        "label": "Session Lifecycle",
-        "icon": "emblem-synchronizing",
-        "path": "~/.agent/diagrams/claude-session-lifecycle.html",
-        "tooltip": "Session Lifecycle — Phasen, Hooks, Checkpoints",
-        "category": "service",
-    },
-    {
-        "label": "Delegation Map",
-        "icon": "emblem-shared",
-        "path": "~/.agent/diagrams/claude-delegation-architecture.html",
-        "tooltip": "Delegation Architecture — Opus→Sonnet→Haiku→Gemini",
-        "category": "service",
-    },
-    {
-        "label": "Skill Ecosystem",
-        "icon": "emblem-package",
-        "path": "~/.agent/diagrams/claude-skill-ecosystem.html",
-        "tooltip": "Skill Ecosystem — Alle Skills + Trigger + Kosten",
-        "category": "service",
-    },
-    {
-        "label": "Cost Dashboard",
-        "icon": "emblem-money",
-        "path": "~/.agent/diagrams/claude-cost-dashboard.html",
-        "tooltip": "Cost Dashboard — Kosten-Analyse + Optimierung",
-        "category": "service",
-    },
     # --- Docs (Yellow #f9e2af) — reference, guides, knowledge ---
     {
         "label": "CLAUDE.md",
@@ -295,6 +266,48 @@ def _open_path(path: str) -> None:
     if not resolved.exists():
         return  # silently skip missing paths
     subprocess.Popen(["xdg-open", str(resolved)], start_new_session=True)
+
+
+_DIAGRAMS_DIR = Path.home() / ".agent" / "diagrams"
+
+
+def _build_diagram_buttons(flowbox: "Gtk.FlowBox") -> None:
+    """Dynamically scan ~/.agent/diagrams/ for HTML files."""
+    # Clear existing children
+    for child in flowbox.get_children():
+        flowbox.remove(child)
+
+    if not _DIAGRAMS_DIR.exists():
+        label = Gtk.Label(label="Keine Diagramme gefunden")
+        label.get_style_context().add_class("session-meta")
+        flowbox.add(label)
+        flowbox.show_all()
+        return
+
+    # Recursively find all HTML files, sorted by mtime (newest first)
+    html_files = sorted(
+        _DIAGRAMS_DIR.rglob("*.html"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not html_files:
+        label = Gtk.Label(label="Keine Diagramme gefunden")
+        label.get_style_context().add_class("session-meta")
+        flowbox.add(label)
+        flowbox.show_all()
+        return
+
+    for html_path in html_files[:20]:  # Cap at 20 newest
+        name = html_path.stem.replace("_", " ").replace("-", " ").title()
+        btn = Gtk.Button(label=name)
+        btn.get_style_context().add_class("shortcut-btn")
+        btn.get_style_context().add_class("shortcut-docs")
+        btn.set_tooltip_text(str(html_path))
+        btn.connect("clicked", lambda b, p=str(html_path): _open_path(p))
+        flowbox.add(btn)
+
+    flowbox.show_all()
 
 
 def _run_command(cmd: str) -> None:
@@ -535,10 +548,10 @@ class ControlPanel(Gtk.Window):
         watcher_frame.add(watcher_grid)
         vbox.pack_start(watcher_frame, False, False, 4)
 
-        # Set up Gio.FileMonitor on specific sidecar log file (not whole /tmp)
+        # Set up Gio.FileMonitor on Sidecar V6 socket file
         self._sidecar_monitor = None
         try:
-            gio_file = Gio.File.new_for_path("/tmp/claude-sidecar.log")
+            gio_file = Gio.File.new_for_path("/tmp/sidecar-v6.sock")
             self._sidecar_monitor = gio_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
             self._sidecar_monitor.connect("changed", self._on_sidecar_changed)
         except Exception:
@@ -557,23 +570,8 @@ class ControlPanel(Gtk.Window):
         diagrams_flow.set_row_spacing(4)
         diagrams_flow.set_column_spacing(6)
 
-        _DIAGRAMS = [
-            ("Lifecycle", "claude-session-lifecycle.html"),
-            ("Delegation", "claude-delegation-architecture.html"),
-            ("Skills", "claude-skill-ecosystem.html"),
-            ("Kosten", "claude-cost-dashboard.html"),
-            ("Oktopus", "oktopus-visual.html"),
-            ("UX Guide", "panel-ux-guide.html"),
-        ]
-        _DIAGRAMS_DIR = str(Path.home() / ".agent" / "diagrams")
-        for label, filename in _DIAGRAMS:
-            btn = Gtk.Button(label=label)
-            btn.get_style_context().add_class("shortcut-btn")
-            btn.get_style_context().add_class("shortcut-docs")
-            filepath = f"{_DIAGRAMS_DIR}/{filename}"
-            btn.connect("clicked", lambda _, p=filepath: _open_path(p))
-            btn.set_tooltip_text(filename)
-            diagrams_flow.add(btn)
+        _build_diagram_buttons(diagrams_flow)
+        self._diagrams_flow = diagrams_flow
 
         vbox.pack_start(diagrams_flow, False, False, 0)
 
@@ -907,6 +905,10 @@ class ControlPanel(Gtk.Window):
             # Sidecar watcher
             sidecar = get_sidecar_status()
             self._update_watcher(sidecar)
+
+            # Refresh diagrams (dynamic scan)
+            if hasattr(self, "_diagrams_flow"):
+                _build_diagram_buttons(self._diagrams_flow)
         except Exception:
             log.exception("refresh hub")
         return True  # keep 30s timer alive
@@ -940,7 +942,7 @@ class ControlPanel(Gtk.Window):
             slot["label"].set_tooltip_text(tooltip)
 
     def _on_sidecar_changed(self, _monitor, file_obj, _other, event_type) -> None:
-        """Called when a file in /tmp changes. Trigger watcher refresh if sidecar file."""
+        """Called when the Sidecar V6 socket file changes. Trigger watcher refresh."""
         if event_type not in (
             Gio.FileMonitorEvent.CHANGED,
             Gio.FileMonitorEvent.CREATED,
@@ -948,7 +950,7 @@ class ControlPanel(Gtk.Window):
         ):
             return
         name = file_obj.get_basename() if file_obj else ""
-        if name and (name.startswith("sidecar-") and name.endswith(".json")):
+        if name == "sidecar-v6.sock":
             GLib.idle_add(self._refresh_watcher_once)
 
     def _refresh_watcher_once(self) -> bool:
