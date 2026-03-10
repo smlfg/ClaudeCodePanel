@@ -631,100 +631,78 @@ def format_cost(usd: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Sidecar Watcher — reads /tmp/sidecar-*.json + /tmp/claude-sidecar.log
+# Sidecar Watcher — queries Sidecar V6 daemon via /tmp/sidecar-v6.sock
 # ---------------------------------------------------------------------------
-DETECTOR_SEVERITY = {
-    "ERROR-CASCADE": "critical",
-    "YOLO": "critical",
-    "THRASH": "critical",
-    "LOOP": "warning",
-    "DRIFT": "warning",
-    "ANTI-PATTERN": "warning",
-    "READ-STORM": "warning",
-    "STALL": "info",
-    "SKILL-SUGGEST": "info",
-}
-
-_SIDECAR_LOG = Path("/tmp/claude-sidecar.log")
-_SIDECAR_CACHE_TTL = 10  # shorter TTL for real-time monitoring
 
 
 def get_sidecar_status() -> dict:
-    """Read sidecar files and parse detector status (cached 10s).
-
-    Returns:
-    {
-        "active_sessions": 3,
-        "detectors": {
-            "LOOP": {"active": True, "severity": "warning", "last_seen": "14:32", "count": 3},
-            ...
-        },
-        "overall_severity": "warning",
-    }
-    """
-    cached = _cache_get("sidecar_status")
+    """Query Sidecar V6 daemon via Unix socket."""
+    cache_key = "sidecar_status"
+    cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # Count active sidecar session files
-    active_sessions = sum(1 for _ in Path("/tmp").glob("sidecar-*.json"))
-
-    # Init all detectors as inactive
-    detectors: dict[str, dict] = {}
-    for name, severity in DETECTOR_SEVERITY.items():
-        detectors[name] = {
-            "active": False,
-            "severity": severity,
-            "last_seen": None,
-            "count": 0,
-        }
-
-    # Parse last 50 lines of sidecar log for detector mentions
-    if _SIDECAR_LOG.exists():
-        try:
-            lines = _SIDECAR_LOG.read_text(errors="replace").splitlines()
-            for line in lines[-50:]:
-                # Format: [2026-03-04 14:32:01] session=abc tool=Bash findings=2 score=0.7 detectors=LOOP,STALL
-                if "detectors=" not in line:
-                    continue
-                # Extract timestamp
-                time_str = None
-                if line.startswith("["):
-                    bracket_end = line.find("]")
-                    if bracket_end > 0:
-                        ts_part = line[1:bracket_end]  # "2026-03-04 14:32:01"
-                        if " " in ts_part:
-                            time_str = ts_part.split(" ", 1)[1][:5]  # "14:32"
-
-                # Extract detectors
-                det_start = line.find("detectors=") + len("detectors=")
-                det_end = line.find(" ", det_start)
-                det_str = line[det_start:] if det_end == -1 else line[det_start:det_end]
-                det_str = det_str.strip()
-
-                for det_name in det_str.split(","):
-                    det_name = det_name.strip().upper()
-                    if det_name in detectors:
-                        detectors[det_name]["active"] = True
-                        detectors[det_name]["count"] += 1
-                        if time_str:
-                            detectors[det_name]["last_seen"] = time_str
-        except (OSError, PermissionError):
-            pass
-
-    # Determine overall severity (highest active)
-    severity_rank = {"critical": 3, "warning": 2, "info": 1, "none": 0}
-    overall_severity = "none"
-    for det in detectors.values():
-        if det["active"]:
-            sev = det["severity"]
-            if severity_rank.get(sev, 0) > severity_rank.get(overall_severity, 0):
-                overall_severity = sev
-
     result = {
-        "active_sessions": active_sessions,
-        "detectors": detectors,
-        "overall_severity": overall_severity,
+        "running": False,
+        "sessions": 0,
+        "active_findings": [],
+        "mechanisms_total": 0,
+        "mechanisms_active": 0,
+        "phase": "",
     }
-    _cache_set("sidecar_status", result, ttl=_SIDECAR_CACHE_TTL)
+
+    sock_path = Path("/tmp/sidecar-v6.sock")
+    if not sock_path.exists():
+        _cache_set(cache_key, result, ttl=10)
+        return result
+
+    try:
+        import socket as sock_mod
+
+        def _query(request: dict) -> dict:
+            s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            s.settimeout(2.0)
+            try:
+                s.connect(str(sock_path))
+                s.sendall((json.dumps(request) + "\n").encode())
+                data = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b"\n" in data:
+                        break
+                return json.loads(data.decode().strip())
+            finally:
+                s.close()
+
+        # Query status
+        status_resp = _query({"type": "ctl", "cmd": "status"})
+        result["running"] = True
+
+        session_data = status_resp.get("session", {})
+        result["phase"] = session_data.get("phase", "")
+
+        # Count V6 session files
+        v6_sessions = list(Path("/tmp").glob("sidecar-v6-ses-*.json"))
+        result["sessions"] = len(v6_sessions)
+
+        # Query ranking for mechanism info
+        try:
+            ranking_resp = _query({"type": "ctl", "cmd": "ranking"})
+            result["mechanisms_total"] = ranking_resp.get("total", 0)
+            result["mechanisms_active"] = ranking_resp.get("active", 0)
+
+            # Extract active findings from mechanisms
+            mechanisms = ranking_resp.get("mechanisms", [])
+            active = [m.get("name", "") for m in mechanisms if m.get("active", False)]
+            result["active_findings"] = active[:10]  # cap at 10
+        except Exception:
+            pass  # ranking query is optional
+
+    except Exception:
+        log.exception("sidecar v6 query")
+
+    _cache_set(cache_key, result, ttl=10)
     return result
