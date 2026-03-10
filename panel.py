@@ -381,7 +381,7 @@ class ControlPanel(Gtk.Window):
         GLib.timeout_add_seconds(30, self._refresh_hub)
         GLib.timeout_add_seconds(15, self._start_monitor_timer)
         GLib.timeout_add_seconds(10, refresh_logs)
-        GLib.timeout_add_seconds(15, refresh_sessions)
+        GLib.timeout_add_seconds(60, refresh_sessions)
         GLib.timeout_add_seconds(30, refresh_processes)
         GLib.timeout_add_seconds(30, self._refresh_cost)
         GLib.timeout_add_seconds(30, refresh_swarm)

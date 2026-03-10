@@ -17,6 +17,7 @@ import logging
 import re
 import shlex
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +54,10 @@ _state: dict = {
     "debounce_id": None,    # GLib timeout source ID for debounce
     "batch_id": None,       # GLib idle source ID for batch insertion
 }
+
+# Cancellation token for the background grep thread.
+# Replaced with a fresh Event each time a new search starts.
+_search_cancel: threading.Event = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -831,21 +836,45 @@ def _on_search_changed(_entry: Gtk.SearchEntry) -> None:
     _state["debounce_id"] = GLib.timeout_add(300, _execute_search, query)
 
 
-def _execute_search(query: str) -> bool:
-    """Run grep search and populate results in batches. Returns False (one-shot)."""
-    _state["debounce_id"] = None
-    _state["search_mode"] = True
-
-    results = _grep_sessions(query)
-
+def _show_search_status(message: str) -> None:
+    """Clear the ListBox and show a status message placeholder. GTK-thread only."""
     if _state["list_box"] is None:
-        return False
+        return
 
-    # Clear existing rows
+    # Cancel any running batch insertion first
+    if _state["batch_id"] is not None:
+        GLib.source_remove(_state["batch_id"])
+        _state["batch_id"] = None
+
     for child in _state["list_box"].get_children():
         _state["list_box"].remove(child)
 
-    # Update stats immediately (user sees count sofort)
+    placeholder = Gtk.Label(label=message)
+    placeholder.get_style_context().add_class("session-meta")
+    placeholder.set_margin_top(16)
+    placeholder.set_margin_bottom(16)
+    row = Gtk.ListBoxRow()
+    row.set_activatable(False)
+    row.add(placeholder)
+    row.show_all()
+    _state["list_box"].add(row)
+    _state["list_box"].show_all()
+
+
+def _display_search_results(results: list, query: str) -> bool:
+    """Populate the ListBox with search results in batches. GTK-thread only.
+
+    Called via GLib.idle_add from the background worker thread.
+    Returns False (one-shot).
+    """
+    if _state["list_box"] is None:
+        return False
+
+    # Clear the "Suche..." placeholder (and any stale rows)
+    for child in _state["list_box"].get_children():
+        _state["list_box"].remove(child)
+
+    # Update stats bar
     if _state["stats_label"] is not None:
         total_matches = sum(s.get("match_count", 0) for s in results)
         _state["stats_label"].set_text(
@@ -880,6 +909,35 @@ def _execute_search(query: str) -> bool:
             return False  # done
 
     _state["batch_id"] = GLib.idle_add(_insert_batch)
+    return False  # one-shot
+
+
+def _execute_search(query: str) -> bool:
+    """Kick off a non-blocking grep search. Returns False (one-shot GLib timer)."""
+    global _search_cancel
+
+    _state["debounce_id"] = None
+    _state["search_mode"] = True
+
+    # Signal any previous background search to abort early
+    _search_cancel.set()
+    cancel = threading.Event()
+    _search_cancel = cancel
+
+    # Immediate visual feedback — clears the list and shows "Suche..."
+    _show_search_status("Suche…")
+
+    def _worker() -> None:
+        if cancel.is_set():
+            return
+        results = _grep_sessions(query)
+        if cancel.is_set():
+            return
+        GLib.idle_add(_display_search_results, results, query)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
     return False  # one-shot timer
 
 
