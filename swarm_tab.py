@@ -9,6 +9,7 @@ as the old WebKit-based version.
 """
 
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -212,7 +213,7 @@ def _collect_comm_data(team_name: str) -> dict:
     all_msgs.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
 
     return {"members": members, "tasks": tasks, "new_messages": all_msgs[:5],
-            "events": _read_recent_events(20)}
+            "events": []}
 
 
 def _load_messages(team_name: str, limit: int = 10) -> list[dict]:
@@ -278,38 +279,67 @@ def _read_recent_events(limit: int = 20) -> list[dict]:
     if not event_file.exists():
         return []
 
-    # Day rollover — reset offset
+    # Day rollover — seek near end instead of reading from byte 0
     if today != _events_current_day:
-        _events_file_offset = 0
+        file_size = event_file.stat().st_size
+        _events_file_offset = max(0, file_size - 50_000)
         _events_current_day = today
 
-    events = []
+    new_lines = []
     try:
         with open(event_file, "r", encoding="utf-8") as f:
             f.seek(_events_file_offset)
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                    et = ev.get("event_type") or ev.get("hook_event_name", "")
-                    if et in _INTERESTING_EVENTS:
-                        events.append({
-                            "type": et,
-                            "tool": ev.get("tool_name", ""),
-                            "time": ev.get("logged_iso", ""),
-                            "session": ev.get("session_id", "")[:8],
-                            "agent": ev.get("tool_input", {}).get("agentName", ""),
-                        })
-                except json.JSONDecodeError:
-                    pass
+            new_lines = f.readlines()
             _events_file_offset = f.tell()
     except OSError:
         pass
 
+    # Cap at last 100 lines to avoid processing stale history on day rollover
+    if len(new_lines) > 100:
+        new_lines = new_lines[-100:]
+
+    events = []
+    for line in new_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+            et = ev.get("event_type") or ev.get("hook_event_name", "")
+            if et in _INTERESTING_EVENTS:
+                events.append({
+                    "type": et,
+                    "tool": ev.get("tool_name", ""),
+                    "time": ev.get("logged_iso", ""),
+                    "session": ev.get("session_id", "")[:8],
+                    "agent": ev.get("tool_input", {}).get("agentName", ""),
+                })
+        except json.JSONDecodeError:
+            pass
+
     # Return only the last `limit` events
     return events[-limit:]
+
+
+def _update_events_ui(events: list[dict]) -> bool:
+    """Push events to the WebKit view on the GTK main thread. idle_add callback."""
+    if not (_stack and _stack.get_visible_child_name() == "visual"
+            and _webview and _webview_ready):
+        return False
+    js = f"if(typeof updateEvents==='function')updateEvents({json.dumps(events, ensure_ascii=False)})"
+    _webview.run_javascript(js, None, None, None)
+    return False  # one-shot: do not repeat
+
+
+def _read_events_async() -> None:
+    """Read events in background thread, update UI via idle_add."""
+    def _worker():
+        events = _read_recent_events(20)
+        if events:
+            GLib.idle_add(_update_events_ui, events)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +443,7 @@ def _collect_live_data() -> dict:
         ],
         "total_cost_usd": cost_data.get("cost_usd", 0.0),
         "active_agent_count": len(active_sessions),
-        "events": _read_recent_events(20),
+        "events": [],
     }
 
 
@@ -912,6 +942,8 @@ def refresh_swarm() -> bool:
 
     try:
         _refresh_content()
+        # Async event read — offloaded to background thread
+        _read_events_async()
         # Also update visual view if visible and ready
         if (
             _stack
