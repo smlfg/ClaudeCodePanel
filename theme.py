@@ -304,6 +304,42 @@ notebook tab:checked {{
 .watcher-dot-inactive {{ color: {p["dim"]}; font-size: 16px; }}
 .watcher-name {{ font-family: monospace; font-size: 11px; color: {p["subtext1"]}; }}
 
+.phase-badge {{
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 4px 10px;
+    border-radius: 12px;
+    color: {p["text"]};
+}}
+.phase-badge-exploration {{ background: rgba(137,180,250,0.25); color: {p["accent"]}; }}
+.phase-badge-implementation {{ background: rgba(166,227,161,0.25); color: {p["green"]}; }}
+.phase-badge-testing {{ background: rgba(249,226,175,0.25); color: {p["yellow"]}; }}
+.phase-badge-debugging {{ background: rgba(243,139,168,0.25); color: {p["red"]}; }}
+
+.signal-card {{
+    border-radius: 8px;
+    background: {p["card"]};
+    border: 1px solid {p["border"]};
+    padding: 12px;
+}}
+.cost-value {{
+    font-family: monospace;
+    font-size: 20px;
+    font-weight: bold;
+    color: {p["yellow"]};
+}}
+.mon-stat-value {{
+    font-family: monospace;
+    font-size: 16px;
+    font-weight: bold;
+    color: {p["accent"]};
+}}
+.stat-sublabel {{
+    font-size: 11px;
+    color: {p["subtext1"]};
+}}
+
 .sc-card {{
     border-radius: 8px;
     background: {p["card"]};

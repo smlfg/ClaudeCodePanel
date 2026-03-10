@@ -635,6 +635,15 @@ def format_cost(usd: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _category_to_severity(category: str) -> str:
+    """Map V6 mechanism category to UI severity level."""
+    if category == "safety":
+        return "critical"
+    if category in ("adhs", "context"):
+        return "warning"
+    return "info"
+
+
 def get_sidecar_status() -> dict:
     """Query Sidecar V6 daemon via Unix socket."""
     cache_key = "sidecar_status"
@@ -646,6 +655,8 @@ def get_sidecar_status() -> dict:
         "running": False,
         "sessions": 0,
         "active_findings": [],
+        "detectors": {},
+        "mechanisms_list": [],
         "mechanisms_total": 0,
         "mechanisms_active": 0,
         "phase": "",
@@ -693,10 +704,24 @@ def get_sidecar_status() -> dict:
             result["mechanisms_total"] = ranking_resp.get("total", 0)
             result["mechanisms_active"] = ranking_resp.get("active", 0)
 
-            # Extract active findings from mechanisms
+            # Build detectors dict for UI (panel.py, swarm_tab.py)
             mechanisms = ranking_resp.get("mechanisms", [])
-            active = [m.get("name", "") for m in mechanisms if m.get("active", False)]
-            result["active_findings"] = active[:10]  # cap at 10
+            detectors = {}
+            for m in mechanisms:
+                name = m.get("name", "")
+                if not name:
+                    continue
+                detectors[name] = {
+                    "active": m.get("active", False),
+                    "severity": _category_to_severity(m.get("category", "")),
+                    "count": m.get("fire_count", 0),
+                    "last_seen": m.get("last_seen", ""),
+                }
+            result["detectors"] = detectors
+            result["mechanisms_list"] = mechanisms  # full data for Monitor tab
+            result["active_findings"] = [
+                n for n, d in detectors.items() if d["active"]
+            ][:10]
         except Exception:
             pass  # ranking query is optional
 

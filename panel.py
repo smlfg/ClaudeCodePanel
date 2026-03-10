@@ -507,45 +507,26 @@ class ControlPanel(Gtk.Window):
         watcher_label.get_style_context().add_class("section-title")
         vbox.pack_start(watcher_label, False, False, 4)
 
+        # Phase badge
+        self._phase_label = Gtk.Label(label="Sidecar offline")
+        self._phase_label.set_xalign(0)
+        self._phase_label.get_style_context().add_class("phase-badge")
+        self._phase_label.set_margin_start(10)
+        self._phase_label.set_margin_top(4)
+        vbox.pack_start(self._phase_label, False, False, 0)
+
         watcher_frame = Gtk.Frame()
         watcher_frame.get_style_context().add_class("section-frame")
-        watcher_grid = Gtk.Grid()
-        watcher_grid.set_column_spacing(8)
-        watcher_grid.set_row_spacing(4)
-        watcher_grid.set_margin_top(8)
-        watcher_grid.set_margin_bottom(8)
-        watcher_grid.set_margin_start(10)
-        watcher_grid.set_margin_end(10)
-
-        # Detector grid layout: (name, abbrev, row, col)
-        detector_layout = [
-            ("ERROR-CASCADE", "ERR-CASC", 0, 0),
-            ("YOLO",          "YOLO",     0, 1),
-            ("THRASH",        "THRSH",    0, 2),
-            ("LOOP",          "LOOP",     1, 0),
-            ("DRIFT",         "DRIFT",    1, 1),
-            ("ANTI-PATTERN",  "ANTI",     1, 2),
-            ("READ-STORM",    "READ-S",   2, 0),
-            ("STALL",         "STALL",    2, 1),
-            ("SKILL-SUGGEST", "SKILL",    2, 2),
-        ]
-
-        self._watcher_slots = {}
-        for det_name, abbrev, row_idx, col_idx in detector_layout:
-            cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-
-            dot = Gtk.Label(label="\u25CF")
-            dot.get_style_context().add_class("watcher-dot-inactive")
-            cell.pack_start(dot, False, False, 0)
-
-            name_lbl = Gtk.Label(label=abbrev, xalign=0)
-            name_lbl.get_style_context().add_class("watcher-name")
-            cell.pack_start(name_lbl, False, False, 0)
-
-            watcher_grid.attach(cell, col_idx, row_idx, 1, 1)
-            self._watcher_slots[det_name] = {"dot": dot, "label": name_lbl}
-
-        watcher_frame.add(watcher_grid)
+        self._watcher_flow = Gtk.FlowBox()
+        self._watcher_flow.set_max_children_per_line(4)
+        self._watcher_flow.set_min_children_per_line(3)
+        self._watcher_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._watcher_flow.set_homogeneous(True)
+        self._watcher_flow.set_margin_top(8)
+        self._watcher_flow.set_margin_bottom(8)
+        self._watcher_flow.set_margin_start(10)
+        self._watcher_flow.set_margin_end(10)
+        watcher_frame.add(self._watcher_flow)
         vbox.pack_start(watcher_frame, False, False, 4)
 
         # Set up Gio.FileMonitor on Sidecar V6 socket file
@@ -914,32 +895,81 @@ class ControlPanel(Gtk.Window):
         return True  # keep 30s timer alive
 
     def _update_watcher(self, data: dict) -> None:
-        """Update watcher dot colors and tooltips from sidecar status dict."""
+        """Update watcher dots dynamically from sidecar detectors dict."""
         detectors = data.get("detectors", {})
-        for det_name, slot in self._watcher_slots.items():
-            det = detectors.get(det_name, {})
-            active = det.get("active", False)
-            severity = det.get("severity", "info")
-            last_seen = det.get("last_seen")
-            count = det.get("count", 0)
+        phase = data.get("phase", "")
+        running = data.get("running", False)
 
-            # Remove all existing style classes from dot
-            ctx = slot["dot"].get_style_context()
-            for cls in ("watcher-dot-critical", "watcher-dot-warning",
-                        "watcher-dot-info", "watcher-dot-inactive"):
+        # Update phase badge
+        if not running:
+            self._phase_label.set_text("Sidecar offline")
+            ctx = self._phase_label.get_style_context()
+            for cls in ("phase-badge-exploration", "phase-badge-implementation",
+                        "phase-badge-testing", "phase-badge-debugging"):
+                ctx.remove_class(cls)
+        elif phase:
+            self._phase_label.set_text(f"\u25cf {phase.upper()}")
+            ctx = self._phase_label.get_style_context()
+            for cls in ("phase-badge-exploration", "phase-badge-implementation",
+                        "phase-badge-testing", "phase-badge-debugging"):
+                ctx.remove_class(cls)
+            ctx.add_class(f"phase-badge-{phase}")
+        else:
+            self._phase_label.set_text("\u25cf IDLE")
+            ctx = self._phase_label.get_style_context()
+            for cls in ("phase-badge-exploration", "phase-badge-implementation",
+                        "phase-badge-testing", "phase-badge-debugging"):
                 ctx.remove_class(cls)
 
+        # Clear existing flow children
+        for child in self._watcher_flow.get_children():
+            self._watcher_flow.remove(child)
+
+        # Sort: active first (by count desc), then inactive
+        sorted_dets = sorted(
+            detectors.items(),
+            key=lambda x: (not x[1].get("active", False), -x[1].get("count", 0)),
+        )
+
+        # Show top 12
+        shown = sorted_dets[:12]
+        for det_name, det in shown:
+            cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            dot = Gtk.Label(label="\u25cf")
+            active = det.get("active", False)
+            severity = det.get("severity", "info")
             if active:
-                ctx.add_class(f"watcher-dot-{severity}")
-                tooltip = f"{det_name}: {count}x"
-                if last_seen:
-                    tooltip += f" (zuletzt {last_seen})"
+                dot.get_style_context().add_class(f"watcher-dot-{severity}")
+                tooltip = f"{det_name}: {det.get('count', 0)}x"
+                last = det.get("last_seen", "")
+                if last:
+                    tooltip += f" (zuletzt {last})"
             else:
-                ctx.add_class("watcher-dot-inactive")
+                dot.get_style_context().add_class("watcher-dot-inactive")
                 tooltip = f"{det_name}: inaktiv"
 
-            slot["dot"].set_tooltip_text(tooltip)
-            slot["label"].set_tooltip_text(tooltip)
+            cell.pack_start(dot, False, False, 0)
+
+            # Short name: take first 8 chars, replace underscores with hyphens
+            short = det_name.replace("_", "-")[:8].upper()
+            name_lbl = Gtk.Label(label=short, xalign=0)
+            name_lbl.get_style_context().add_class("watcher-name")
+            name_lbl.set_tooltip_text(tooltip)
+            cell.pack_start(name_lbl, False, False, 0)
+            dot.set_tooltip_text(tooltip)
+
+            cell.show_all()
+            self._watcher_flow.add(cell)
+
+        # Rest counter
+        rest = len(sorted_dets) - len(shown)
+        if rest > 0:
+            rest_label = Gtk.Label(label=f"+{rest} weitere")
+            rest_label.get_style_context().add_class("watcher-name")
+            rest_label.show_all()
+            self._watcher_flow.add(rest_label)
+
+        self._watcher_flow.show_all()
 
     def _on_sidecar_changed(self, _monitor, file_obj, _other, event_type) -> None:
         """Called when the Sidecar V6 socket file changes. Trigger watcher refresh."""
@@ -1270,51 +1300,102 @@ class ControlPanel(Gtk.Window):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         vbox.set_margin_top(16)
         vbox.set_margin_bottom(16)
         vbox.set_margin_start(16)
         vbox.set_margin_end(16)
 
-        # Daily Cost
-        cost_frame = Gtk.Frame(label="  Heutige Kosten  ")
-        self.cost_label = Gtk.Label(label="Lade...")
-        self.cost_label.get_style_context().add_class("monitor-value")
-        self.cost_label.set_margin_top(10)
-        self.cost_label.set_margin_bottom(10)
-        cost_frame.add(self.cost_label)
-        vbox.pack_start(cost_frame, False, False, 0)
+        # Phase badge (reuses same CSS as Hub tab)
+        self._monitor_phase_label = Gtk.Label(label="Sidecar offline")
+        self._monitor_phase_label.set_xalign(0)
+        self._monitor_phase_label.get_style_context().add_class("phase-badge")
+        vbox.pack_start(self._monitor_phase_label, False, False, 0)
 
-        # Active Sessions
-        sessions_frame = Gtk.Frame(label="  Aktive Sessions  ")
-        self.monitor_sessions_label = Gtk.Label(label="Lade...")
-        self.monitor_sessions_label.set_margin_top(8)
-        self.monitor_sessions_label.set_margin_bottom(8)
-        self.monitor_sessions_label.set_xalign(0)
-        self.monitor_sessions_label.set_margin_start(10)
-        sessions_frame.add(self.monitor_sessions_label)
-        vbox.pack_start(sessions_frame, False, False, 0)
+        # --- Cost + Sessions row ---
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        top_row.set_homogeneous(True)
 
-        # Top Tools
-        tools_frame = Gtk.Frame(label="  Top 5 Tools  ")
-        self.tools_label = Gtk.Label(label="Lade...")
-        self.tools_label.get_style_context().add_class("monitor-value")
-        self.tools_label.set_margin_top(8)
-        self.tools_label.set_margin_bottom(8)
-        self.tools_label.set_xalign(0)
-        self.tools_label.set_margin_start(10)
-        tools_frame.add(self.tools_label)
-        vbox.pack_start(tools_frame, False, False, 0)
+        # Cost card
+        cost_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cost_card.get_style_context().add_class("signal-card")
+        cost_card.set_margin_top(6)
+        cost_card.set_margin_bottom(6)
+        self._mon_cost_value = Gtk.Label(label="$0.00")
+        self._mon_cost_value.set_xalign(0)
+        self._mon_cost_value.get_style_context().add_class("cost-value")
+        cost_card.pack_start(self._mon_cost_value, False, False, 0)
+        self._mon_cost_sub = Gtk.Label(label="0 Calls, 0 Tools")
+        self._mon_cost_sub.set_xalign(0)
+        self._mon_cost_sub.get_style_context().add_class("stat-sublabel")
+        cost_card.pack_start(self._mon_cost_sub, False, False, 0)
+        top_row.pack_start(cost_card, True, True, 0)
 
-        # Missed Skills
-        skills_frame = Gtk.Frame(label="  Verpasste Skills  ")
-        self.skills_label = Gtk.Label(label="Lade...")
-        self.skills_label.set_margin_top(8)
-        self.skills_label.set_margin_bottom(8)
-        self.skills_label.set_xalign(0)
-        self.skills_label.set_margin_start(10)
-        skills_frame.add(self.skills_label)
-        vbox.pack_start(skills_frame, False, False, 0)
+        # Sessions card
+        sess_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        sess_card.get_style_context().add_class("signal-card")
+        sess_card.set_margin_top(6)
+        sess_card.set_margin_bottom(6)
+        self._mon_sess_value = Gtk.Label(label="0 Sessions")
+        self._mon_sess_value.set_xalign(0)
+        self._mon_sess_value.get_style_context().add_class("mon-stat-value")
+        sess_card.pack_start(self._mon_sess_value, False, False, 0)
+        self._mon_sess_sub = Gtk.Label(label="")
+        self._mon_sess_sub.set_xalign(0)
+        self._mon_sess_sub.get_style_context().add_class("stat-sublabel")
+        self._mon_sess_sub.set_line_wrap(True)
+        sess_card.pack_start(self._mon_sess_sub, False, False, 0)
+        top_row.pack_start(sess_card, True, True, 0)
+
+        vbox.pack_start(top_row, False, False, 0)
+
+        # --- Mechanisms card ---
+        mech_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        mech_card.get_style_context().add_class("signal-card")
+        mech_label = Gtk.Label(label="Mechanisms", xalign=0)
+        mech_label.get_style_context().add_class("stat-sublabel")
+        mech_card.pack_start(mech_label, False, False, 0)
+        self._mon_mech_bar = Gtk.LevelBar()
+        self._mon_mech_bar.set_min_value(0)
+        self._mon_mech_bar.set_max_value(36)
+        self._mon_mech_bar.set_value(0)
+        self._mon_mech_bar.set_size_request(-1, 16)
+        mech_card.pack_start(self._mon_mech_bar, False, False, 0)
+        self._mon_mech_sub = Gtk.Label(label="0/36 aktiv")
+        self._mon_mech_sub.set_xalign(0)
+        self._mon_mech_sub.get_style_context().add_class("stat-sublabel")
+        mech_card.pack_start(self._mon_mech_sub, False, False, 0)
+        vbox.pack_start(mech_card, False, False, 0)
+
+        # --- Tools + Skills row ---
+        bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bottom_row.set_homogeneous(True)
+
+        # Top Tools card
+        tools_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        tools_card.get_style_context().add_class("signal-card")
+        tools_title = Gtk.Label(label="Top Tools", xalign=0)
+        tools_title.get_style_context().add_class("stat-sublabel")
+        tools_card.pack_start(tools_title, False, False, 0)
+        self._mon_tools_label = Gtk.Label(label="Keine Daten")
+        self._mon_tools_label.set_xalign(0)
+        self._mon_tools_label.get_style_context().add_class("monitor-value")
+        tools_card.pack_start(self._mon_tools_label, False, False, 0)
+        bottom_row.pack_start(tools_card, True, True, 0)
+
+        # Missed Skills card
+        skills_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        skills_card.get_style_context().add_class("signal-card")
+        skills_title = Gtk.Label(label="Verpasste Skills", xalign=0)
+        skills_title.get_style_context().add_class("stat-sublabel")
+        skills_card.pack_start(skills_title, False, False, 0)
+        self._mon_skills_label = Gtk.Label(label="Keine")
+        self._mon_skills_label.set_xalign(0)
+        self._mon_skills_label.get_style_context().add_class("monitor-value")
+        skills_card.pack_start(self._mon_skills_label, False, False, 0)
+        bottom_row.pack_start(skills_card, True, True, 0)
+
+        vbox.pack_start(bottom_row, False, False, 0)
 
         scrolled.add(vbox)
         self.notebook.append_page(scrolled, Gtk.Label(label="Monitor"))
@@ -1322,43 +1403,88 @@ class ControlPanel(Gtk.Window):
         idle_once(self._refresh_monitor)
 
     def _refresh_monitor(self) -> bool:
-        """Refresh monitor tab data only. Does NOT call _refresh_hub."""
+        """Refresh monitor tab with signal cards."""
         try:
             # Cost
             cost_data = get_daily_cost()
             if "error" not in cost_data:
-                self.cost_label.set_text(
-                    f"{format_cost(cost_data['cost_estimate_usd'])}  "
-                    f"({cost_data['total_calls']} Calls, {cost_data['unique_tools']} Tools)"
+                self._mon_cost_value.set_text(format_cost(cost_data["cost_estimate_usd"]))
+                self._mon_cost_sub.set_text(
+                    f"{cost_data['total_calls']} Calls, {cost_data['unique_tools']} Tools"
                 )
             else:
-                self.cost_label.set_text(cost_data.get("error", "N/A"))
+                self._mon_cost_value.set_text("N/A")
+                self._mon_cost_sub.set_text(cost_data.get("error", ""))
 
             # Sessions
             sessions = get_active_sessions()
             if sessions:
-                lines = [f"  {s['project']}  ({s['age_min']}min)" for s in sessions[:6]]
-                self.monitor_sessions_label.set_text("\n".join(lines))
+                self._mon_sess_value.set_text(f"{len(sessions)} Sessions")
+                names = [s["project"] for s in sessions[:4]]
+                self._mon_sess_sub.set_text(", ".join(names))
             else:
-                self.monitor_sessions_label.set_text("Keine aktiven Sessions")
+                self._mon_sess_value.set_text("0 Sessions")
+                self._mon_sess_sub.set_text("Keine aktiven Sessions")
+
+            # Mechanisms (Sidecar)
+            sidecar = get_sidecar_status()
+
+            # Phase badge (same logic as Hub)
+            running = sidecar.get("running", False)
+            phase = sidecar.get("phase", "")
+            if not running:
+                self._monitor_phase_label.set_text("Sidecar offline")
+                ctx = self._monitor_phase_label.get_style_context()
+                for cls in ("phase-badge-exploration", "phase-badge-implementation",
+                            "phase-badge-testing", "phase-badge-debugging"):
+                    ctx.remove_class(cls)
+            elif phase:
+                self._monitor_phase_label.set_text(f"● {phase.upper()}")
+                ctx = self._monitor_phase_label.get_style_context()
+                for cls in ("phase-badge-exploration", "phase-badge-implementation",
+                            "phase-badge-testing", "phase-badge-debugging"):
+                    ctx.remove_class(cls)
+                ctx.add_class(f"phase-badge-{phase}")
+            else:
+                self._monitor_phase_label.set_text("● IDLE")
+                ctx = self._monitor_phase_label.get_style_context()
+                for cls in ("phase-badge-exploration", "phase-badge-implementation",
+                            "phase-badge-testing", "phase-badge-debugging"):
+                    ctx.remove_class(cls)
+
+            if not running:
+                self._mon_mech_bar.set_value(0)
+                self._mon_mech_sub.set_text("Sidecar offline")
+            else:
+                total = sidecar.get("mechanisms_total", 0) or 36
+                active_count = sidecar.get("mechanisms_active", 0)
+                self._mon_mech_bar.set_max_value(max(total, 1))
+                self._mon_mech_bar.set_value(active_count)
+                active_names = sidecar.get("active_findings", [])
+                if active_names:
+                    self._mon_mech_sub.set_text(
+                        f"{active_count}/{total} aktiv: {', '.join(active_names[:5])}"
+                    )
+                else:
+                    self._mon_mech_sub.set_text(f"{active_count}/{total} aktiv")
 
             # Top Tools
             tools = get_top_tools(5)
             if tools:
-                lines = [f"  {name}: {count}x" for name, count in tools]
-                self.tools_label.set_text("\n".join(lines))
+                lines = [f"{name}: {count}x" for name, count in tools]
+                self._mon_tools_label.set_text("\n".join(lines))
             else:
-                self.tools_label.set_text("Keine Daten")
+                self._mon_tools_label.set_text("Keine Daten")
 
             # Missed Skills
             missed = get_missed_skills_summary()
             if missed:
-                lines = [f"  {skill}: {count}x" for skill, count in missed]
-                self.skills_label.set_text("\n".join(lines))
+                lines = [f"{skill}: {count}x" for skill, count in missed]
+                self._mon_skills_label.set_text("\n".join(lines))
             else:
-                self.skills_label.set_text("Keine verpassten Skills heute")
+                self._mon_skills_label.set_text("Keine verpassten Skills heute")
         except Exception:
-            log.exception("skills label refresh")
+            log.exception("monitor refresh")
         return True  # keep 30s timer alive
 
     # -----------------------------------------------------------------------
