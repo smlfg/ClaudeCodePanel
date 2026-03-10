@@ -119,7 +119,7 @@ def _load_tasks(team_name: str) -> list[dict]:
                 "subject": data.get("subject", "(kein Titel)"),
                 "description": data.get("description", "")[:120],
                 "status": data.get("status", "pending"),
-                "owner": data.get("owner", data.get("subject", "")),
+                "owner": data.get("owner", "(unassigned)"),
             })
         except (json.JSONDecodeError, OSError):
             continue
@@ -263,7 +263,10 @@ def _load_messages(team_name: str, limit: int = 10) -> list[dict]:
 # Event feed — reads hook events from ~/.claude/events/YYYY-MM-DD.jsonl
 # ---------------------------------------------------------------------------
 
-_INTERESTING_EVENTS = {"PostToolUse", "SubagentStart", "SubagentStop", "UserPromptSubmit"}
+_INTERESTING_EVENTS = {
+    "PostToolUse", "PreToolUse", "UserPromptSubmit",
+    "SubagentStart", "SubagentStop", "SubagentComplete",
+}
 
 
 def _read_recent_events(limit: int = 20) -> list[dict]:
@@ -326,7 +329,7 @@ def _update_events_ui(events: list[dict]) -> bool:
     if not (_stack and _stack.get_visible_child_name() == "visual"
             and _webview and _webview_ready):
         return False
-    js = f"if(typeof updateEvents==='function')updateEvents({json.dumps(events, ensure_ascii=False)})"
+    js = f"if(typeof updateEvents==='function')updateEvents({json.dumps(events, ensure_ascii=True)})"
     _webview.run_javascript(js, None, None, None)
     return False  # one-shot: do not repeat
 
@@ -883,7 +886,7 @@ def _push_events_to_webview() -> None:
     events = _read_recent_events(20)
     if not events:
         return
-    js = f"if(typeof updateEvents==='function')updateEvents({json.dumps(events, ensure_ascii=False)})"
+    js = f"if(typeof updateEvents==='function')updateEvents({json.dumps(events, ensure_ascii=True)})"
     _webview.run_javascript(js, None, None, None)
 
 
@@ -955,12 +958,12 @@ def refresh_swarm() -> bool:
             if active_text and active_text != "Alle Teams":
                 # Comm graph: inject updateGraph() with live data
                 data = _collect_comm_data(active_text)
-                js = f"if(typeof updateGraph==='function')updateGraph({json.dumps(data, ensure_ascii=False)})"
+                js = f"if(typeof updateGraph==='function')updateGraph({json.dumps(data, ensure_ascii=True)})"
                 _webview.run_javascript(js, None, None, None)
             else:
                 # Generic swarm view: inject updateSwarm()
                 data = _collect_live_data()
-                js = f"if(typeof updateSwarm==='function')updateSwarm({json.dumps(data, ensure_ascii=False)})"
+                js = f"if(typeof updateSwarm==='function')updateSwarm({json.dumps(data, ensure_ascii=True)})"
                 _webview.run_javascript(js, None, None, None)
     except Exception:
         pass

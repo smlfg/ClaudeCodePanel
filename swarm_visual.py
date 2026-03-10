@@ -86,7 +86,7 @@ def generate_comm_graph(team_name: str) -> str:
     team_dir = TEAMS_DIR / team_name
     config_path = team_dir / "config.json"
     if not config_path.exists():
-        return f"<html><body style='background:#080c10;color:#e6edf3;padding:2em'>Team '{team_name}' nicht gefunden.</body></html>"
+        return f"<html><body style='background:#080c10;color:#e6edf3;padding:2em'>Team '{_esc(team_name)}' nicht gefunden.</body></html>"
 
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -94,7 +94,7 @@ def generate_comm_graph(team_name: str) -> str:
         return f"<html><body style='background:#080c10;color:#e6edf3;padding:2em'>Team '{_esc(team_name)}' config fehlerhaft.</body></html>"
     members = config.get("members", [])
     if not members:
-        return f"<html><body style='background:#080c10;color:#e6edf3;padding:2em'>Team '{team_name}' hat keine Members.</body></html>"
+        return f"<html><body style='background:#080c10;color:#e6edf3;padding:2em'>Team '{_esc(team_name)}' hat keine Members.</body></html>"
 
     # Separate lead from other members
     lead = None
