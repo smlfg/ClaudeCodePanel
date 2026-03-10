@@ -664,15 +664,14 @@ def get_sidecar_status() -> dict:
             s.settimeout(2.0)
             try:
                 s.connect(str(sock_path))
-                s.sendall((json.dumps(request) + "\n").encode())
+                s.sendall(json.dumps(request).encode())
+                s.shutdown(sock_mod.SHUT_WR)  # signal EOF so daemon responds
                 data = b""
                 while True:
-                    chunk = s.recv(4096)
+                    chunk = s.recv(65536)
                     if not chunk:
                         break
                     data += chunk
-                    if b"\n" in data:
-                        break
                 return json.loads(data.decode().strip())
             finally:
                 s.close()
