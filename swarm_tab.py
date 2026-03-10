@@ -17,7 +17,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import Gtk, GLib, Pango, WebKit2
+from gi.repository import Gtk, GLib, Gio, Pango, WebKit2
 
 from theme import get_palette
 from monitor import (
@@ -32,6 +32,14 @@ SWARM_HTML = Path.home() / ".agent" / "diagrams" / "agent-swarm-live.html"
 
 TEAMS_DIR = Path.home() / ".claude" / "teams"
 TASKS_DIR = Path.home() / ".claude" / "tasks"
+EVENTS_DIR = Path.home() / ".claude" / "events"
+
+# Events file offset tracking (like event_tab.py)
+_events_file_offset: int = 0
+_events_current_day: str = ""
+
+# Gio.FileMonitor ref (prevent GC)
+_event_file_monitor: Gio.FileMonitor | None = None
 
 # Module-level refs for refresh
 _webview_ready: bool = False
@@ -203,7 +211,8 @@ def _collect_comm_data(team_name: str) -> dict:
                 continue
     all_msgs.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
 
-    return {"members": members, "tasks": tasks, "new_messages": all_msgs[:5]}
+    return {"members": members, "tasks": tasks, "new_messages": all_msgs[:5],
+            "events": _read_recent_events(20)}
 
 
 def _load_messages(team_name: str, limit: int = 10) -> list[dict]:
@@ -247,6 +256,60 @@ def _load_messages(team_name: str, limit: int = 10) -> list[dict]:
             continue
     messages.sort(key=lambda m: m["sort_key"], reverse=True)
     return messages[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Event feed — reads hook events from ~/.claude/events/YYYY-MM-DD.jsonl
+# ---------------------------------------------------------------------------
+
+_INTERESTING_EVENTS = {"PostToolUse", "SubagentStart", "SubagentStop", "UserPromptSubmit"}
+
+
+def _read_recent_events(limit: int = 20) -> list[dict]:
+    """Read recent interesting events from today's event log.
+
+    Uses file offset tracking to only read new data (like event_tab.py).
+    """
+    global _events_file_offset, _events_current_day
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    event_file = EVENTS_DIR / f"{today}.jsonl"
+
+    if not event_file.exists():
+        return []
+
+    # Day rollover — reset offset
+    if today != _events_current_day:
+        _events_file_offset = 0
+        _events_current_day = today
+
+    events = []
+    try:
+        with open(event_file, "r", encoding="utf-8") as f:
+            f.seek(_events_file_offset)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    et = ev.get("event_type") or ev.get("hook_event_name", "")
+                    if et in _INTERESTING_EVENTS:
+                        events.append({
+                            "type": et,
+                            "tool": ev.get("tool_name", ""),
+                            "time": ev.get("logged_iso", ""),
+                            "session": ev.get("session_id", "")[:8],
+                            "agent": ev.get("tool_input", {}).get("agentName", ""),
+                        })
+                except json.JSONDecodeError:
+                    pass
+            _events_file_offset = f.tell()
+    except OSError:
+        pass
+
+    # Return only the last `limit` events
+    return events[-limit:]
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +413,7 @@ def _collect_live_data() -> dict:
         ],
         "total_cost_usd": cost_data.get("cost_usd", 0.0),
         "active_agent_count": len(active_sessions),
+        "events": _read_recent_events(20),
     }
 
 
@@ -774,17 +838,78 @@ def build_swarm_tab() -> Gtk.Box:
 
     box.pack_start(_stack, True, True, 0)
 
-    # Initial load
+    # Initial load + event file monitor
     GLib.idle_add(_refresh_content)
+    GLib.idle_add(_setup_event_monitor)
 
     return box
 
 
+def _push_events_to_webview() -> None:
+    """Read new events and push them to the WebKit visual view via JS."""
+    if not (_stack and _stack.get_visible_child_name() == "visual"
+            and _webview and _webview_ready):
+        return
+    events = _read_recent_events(20)
+    if not events:
+        return
+    js = f"if(typeof updateEvents==='function')updateEvents({json.dumps(events, ensure_ascii=False)})"
+    _webview.run_javascript(js, None, None, None)
+
+
+def _on_events_file_changed(_monitor, file, _other, event_type) -> None:
+    """Gio.FileMonitor callback — fires on every append to the JSONL file."""
+    if event_type not in (Gio.FileMonitorEvent.CHANGED, Gio.FileMonitorEvent.CHANGES_DONE_HINT):
+        return
+    # Schedule on GLib main loop (file monitor callback may be on any thread)
+    GLib.idle_add(_push_events_to_webview)
+
+
+def _setup_event_monitor() -> None:
+    """Set up Gio.FileMonitor on today's event JSONL file.
+
+    Called once from build_swarm_tab(). Re-called on day rollover from refresh_swarm().
+    """
+    global _event_file_monitor, _events_current_day, _events_file_offset
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _events_current_day == today and _event_file_monitor is not None:
+        return  # already monitoring today's file
+
+    # Cancel previous monitor
+    if _event_file_monitor is not None:
+        _event_file_monitor.cancel()
+        _event_file_monitor = None
+
+    _events_current_day = today
+    _events_file_offset = 0
+
+    event_file = EVENTS_DIR / f"{today}.jsonl"
+    if not event_file.exists():
+        # File doesn't exist yet — check again on next timer tick
+        return
+
+    try:
+        gfile = Gio.File.new_for_path(str(event_file))
+        _event_file_monitor = gfile.monitor_file(Gio.FileMonitorFlags.NONE, None)
+        _event_file_monitor.connect("changed", _on_events_file_changed)
+    except GLib.Error:
+        pass
+
+
 def refresh_swarm() -> bool:
-    """Called by GLib timer from panel.py every 30s."""
+    """Called by GLib timer from panel.py every 30s.
+
+    Handles team/task data refresh + day rollover for event monitor.
+    Event updates are pushed instantly via Gio.FileMonitor (no polling).
+    """
     # Skip if swarm tab is not visible (MiniMax M1 fix)
     if _stack and not _stack.get_mapped():
         return True
+
+    # Re-check event monitor (handles day rollover + late file creation)
+    _setup_event_monitor()
+
     try:
         _refresh_content()
         # Also update visual view if visible and ready

@@ -389,7 +389,7 @@ svg.connections {{
 
 /* ---- BOTTOM PANELS ---- */
 .bottom {{
-  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;
   padding: 14px 20px; max-width: 800px; margin: 0 auto;
 }}
 .section-title {{
@@ -413,6 +413,32 @@ svg.connections {{
   font-family: var(--mono); font-size: 10px;
 }}
 .log-text {{ flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+
+/* ---- EVENT TICKER ---- */
+.event-item {{
+  display: flex; gap: 6px; align-items: baseline; font-size: 11px;
+  padding: 3px 0; border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  animation: event-flash 0.6s ease-out;
+}}
+.event-time {{ color: var(--text-muted); flex-shrink: 0; font-size: 10px; }}
+.event-type {{ flex-shrink: 0; font-size: 9px; font-weight: 600; padding: 1px 4px; border-radius: 3px; }}
+.event-type-PostToolUse {{ background: #e5c07b20; color: #e5c07b; }}
+.event-type-SubagentStart {{ background: #98c37920; color: #98c379; }}
+.event-type-SubagentStop {{ background: #e06c7520; color: #e06c75; }}
+.event-type-UserPromptSubmit {{ background: #61afef20; color: #61afef; }}
+.event-detail {{ flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }}
+@keyframes event-flash {{
+  0% {{ background: rgba(255,255,255,0.06); }}
+  100% {{ background: transparent; }}
+}}
+.activity-flash {{
+  animation: glow-flash 0.8s ease-out;
+}}
+@keyframes glow-flash {{
+  0% {{ box-shadow: 0 0 20px var(--node-color); }}
+  100% {{ box-shadow: none; }}
+}}
 </style>
 </head>
 <body>
@@ -446,6 +472,10 @@ svg.connections {{
   <div>
     <div class="section-title">Messages</div>
     <div id="msg-log">{msg_log_items}</div>
+  </div>
+  <div>
+    <div class="section-title">Live Events</div>
+    <div id="event-ticker"></div>
   </div>
 </div>
 
@@ -610,6 +640,67 @@ function updateGraph(data) {{
     }});
     while (log.children.length > 10) log.removeChild(log.lastChild);
   }}
+}}
+
+// --- LIVE EVENTS ---
+var seenEventCount = 0;
+
+function updateEvents(events) {{
+  if (!events || !events.length) return;
+  var ticker = document.getElementById('event-ticker');
+  if (!ticker) return;
+
+  // Only show new events (compare count)
+  var newEvents = events.slice(seenEventCount);
+  seenEventCount = events.length;
+
+  newEvents.forEach(function(ev) {{
+    var div = document.createElement('div');
+    div.className = 'event-item';
+    var typeClass = 'event-type-' + (ev.type || '').replace(/[^a-zA-Z]/g, '');
+    var detail = ev.tool || ev.agent || ev.session || '';
+    div.innerHTML = '<span class="event-time">' + esc(ev.time || '') + '</span>'
+      + '<span class="event-type ' + typeClass + '">' + esc(ev.type || '') + '</span>'
+      + '<span class="event-detail">' + esc(detail) + '</span>';
+    ticker.prepend(div);
+
+    // Trigger particle burst for PostToolUse
+    if (ev.type === 'PostToolUse') {{
+      var names = {json.dumps([md["name"] for md in member_data if not md["is_lead"]])};
+      var working = names.filter(function(n) {{
+        var dot = document.getElementById('dot-' + n);
+        return dot && dot.classList.contains('status-working');
+      }});
+      if (working.length > 0) {{
+        var target = working[Math.floor(Math.random() * working.length)];
+        animateParticle(target, Math.random() > 0.5);
+      }}
+    }}
+
+    // Flash node on SubagentStart
+    if (ev.type === 'SubagentStart' && ev.agent) {{
+      var node = document.getElementById('node-' + ev.agent);
+      if (node) {{
+        node.classList.add('activity-flash');
+        setTimeout(function() {{ node.classList.remove('activity-flash'); }}, 800);
+      }}
+      var dot = document.getElementById('dot-' + ev.agent);
+      if (dot) {{
+        dot.className = 'status-dot status-working';
+      }}
+    }}
+
+    // Dim node on SubagentStop
+    if (ev.type === 'SubagentStop' && ev.agent) {{
+      var dot = document.getElementById('dot-' + ev.agent);
+      if (dot) {{
+        dot.className = 'status-dot status-idle';
+      }}
+    }}
+  }});
+
+  // Keep ticker to max 20 items
+  while (ticker.children.length > 20) ticker.removeChild(ticker.lastChild);
 }}
 </script>
 </body>

@@ -169,16 +169,34 @@ window {{
     background: {p["card"]};
 }}
 
-.session-row-active {{
+.session-row-working {{
+    border-left: 3px solid {p["yellow"]};
+    background: {p["yellow_hover_bg"]};
+}}
+
+.session-row-working:hover {{
+    background: {p["yellow_hover_bg"]};
+}}
+
+.session-row-ready {{
     border-left: 3px solid {p["green"]};
     background: {p["green_hover_bg"]};
 }}
 
-.session-row-active:hover {{
+.session-row-ready:hover {{
     background: {p["green_hover_bg"]};
 }}
 
-.session-active-badge {{
+.session-working-badge {{
+    background: {p["yellow_hover_bg"]};
+    color: {p["yellow"]};
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+
+.session-ready-badge {{
     background: {p["green_hover_bg"]};
     color: {p["green"]};
     border-radius: 12px;
@@ -423,6 +441,67 @@ notebook tab:checked {{
     font-family: monospace;
     font-size: 11px;
     color: {p["dim"]};
+}}
+
+/* --- Swarm Native Tab --- */
+.swarm-task-row {{
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: transparent;
+    margin: 1px 0;
+}}
+
+.swarm-task-row:hover {{
+    background: {p["card"]};
+}}
+
+.swarm-badge-progress {{
+    color: {p["accent"]};
+    font-weight: bold;
+    font-size: 11px;
+}}
+
+.swarm-badge-completed {{
+    color: {p["green"]};
+    font-weight: bold;
+    font-size: 11px;
+}}
+
+.swarm-badge-pending {{
+    color: {p["dim"]};
+    font-weight: bold;
+    font-size: 11px;
+}}
+
+.swarm-message {{
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: transparent;
+    margin: 1px 0;
+}}
+
+.swarm-message:hover {{
+    background: {p["card"]};
+}}
+
+.session-snippet {{
+    font-family: monospace;
+    font-size: 10px;
+    color: {p["subtext1"]};
+    padding: 2px 0;
+}}
+
+.session-match-badge {{
+    background: {p["accent_hover_bg"]};
+    color: {p["accent"]};
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+
+.session-row-search {{
+    border-left: 3px solid {p["accent"]};
 }}
 """.encode()
 
