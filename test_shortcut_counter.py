@@ -110,34 +110,48 @@ def test_load_rows_with_db():
 
 
 # ---------------------------------------------------------------------------
-# Test 4: _load_config_combos — config missing → returns []
+# Test 4: _load_config — config missing → returns {}
 # ---------------------------------------------------------------------------
 
-def test_load_config_combos_missing():
-    """_load_config_combos must return [] when config.toml does not exist."""
+def test_load_config_missing():
+    """_load_config must return {} when config.toml does not exist."""
     import shortcut_counter_tab as sct
 
     with patch.object(sct, "_CONFIG_PATH", Path("/nonexistent/config.toml")):
-        combos = sct._load_config_combos()
+        config = sct._load_config()
 
-    assert combos == [], f"Expected [], got {combos}"
-    print("PASS  test_load_config_combos_missing")
+    assert config == {}, f"Expected {{}}, got {config}"
+    print("PASS  test_load_config_missing")
 
 
 # ---------------------------------------------------------------------------
-# Test 5: _load_config_combos — real TOML file
+# Test 5: _load_config — real TOML file with [[items]] format
 # ---------------------------------------------------------------------------
 
-def test_load_config_combos_with_file():
-    """_load_config_combos must parse shortcuts from a TOML config."""
+def test_load_config_with_file():
+    """_load_config must parse shortcuts and descriptions from a TOML config."""
     import shortcut_counter_tab as sct
 
     toml_content = b"""
-[shortcuts.Editing]
-combos = ["Ctrl+C", "Ctrl+V", "Ctrl+Z"]
+[[shortcuts.Editing.items]]
+combo = "Ctrl+C"
+desc = "Kopieren"
 
-[shortcuts.Navigation]
-combos = ["Ctrl+Tab", "Alt+F4"]
+[[shortcuts.Editing.items]]
+combo = "Ctrl+V"
+desc = "Einfuegen"
+
+[[shortcuts.Editing.items]]
+combo = "Ctrl+Z"
+desc = "Rueckgaengig"
+
+[[shortcuts.Navigation.items]]
+combo = "Ctrl+Tab"
+desc = "Tab wechseln"
+
+[[shortcuts.Navigation.items]]
+combo = "Alt+F4"
+desc = "Fenster schliessen"
 """
     with tempfile.NamedTemporaryFile(suffix=".toml", delete=False) as f:
         f.write(toml_content)
@@ -145,12 +159,21 @@ combos = ["Ctrl+Tab", "Alt+F4"]
 
     try:
         with patch.object(sct, "_CONFIG_PATH", cfg_path):
-            combos = sct._load_config_combos()
+            config = sct._load_config()
 
-        assert len(combos) == 5, f"Expected 5 combos, got {len(combos)}: {combos}"
-        assert "Ctrl+C" in combos
-        assert "Alt+F4" in combos
-        print("PASS  test_load_config_combos_with_file")
+        assert "Editing" in config, f"Expected 'Editing' category, got {list(config.keys())}"
+        assert "Navigation" in config, f"Expected 'Navigation' category"
+        assert len(config["Editing"]) == 3, f"Expected 3 Editing items, got {len(config['Editing'])}"
+        assert len(config["Navigation"]) == 2, f"Expected 2 Navigation items, got {len(config['Navigation'])}"
+        # Check structure of items
+        first = config["Editing"][0]
+        assert first["combo"] == "Ctrl+C", f"Expected Ctrl+C, got {first['combo']}"
+        assert first["desc"] == "Kopieren", f"Expected 'Kopieren', got {first['desc']}"
+        # Check lookup works
+        all_combos = [it["combo"] for items in config.values() for it in items]
+        assert "Ctrl+C" in all_combos
+        assert "Alt+F4" in all_combos
+        print("PASS  test_load_config_with_file")
     finally:
         cfg_path.unlink(missing_ok=True)
 
@@ -236,8 +259,8 @@ if __name__ == "__main__":
         test_import,
         test_load_rows_missing_db,
         test_load_rows_with_db,
-        test_load_config_combos_missing,
-        test_load_config_combos_with_file,
+        test_load_config_missing,
+        test_load_config_with_file,
         test_status_label,
         test_fmt_last_used,
         test_build_tab_gtk,
