@@ -2294,7 +2294,37 @@ def _build_tray_indicator(win: ControlPanel) -> AyatanaAppIndicator3.Indicator:
     return indicator
 
 
+def _ensure_companion_panel():
+    """Start Sidecar Panel if not already running. Max 1 instance."""
+    companion = Path.home() / "Projekte" / "Sidecar" / "gui" / "main.py"
+    if not companion.exists():
+        return
+    try:
+        result = subprocess.run(
+            ["pgrep", "-cf", f"python3 {companion}"],
+            capture_output=True, timeout=2, text=True,
+        )
+        count = int(result.stdout.strip() or "0")
+        if count == 0:
+            subprocess.Popen(
+                ["python3", str(companion)],
+                cwd=str(companion.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+
+def _companion_watchdog():
+    """Periodically check and restart companion panel (every 30s)."""
+    _ensure_companion_panel()
+    return True  # keep timer running
+
+
 def main():
+    _ensure_companion_panel()
+    GLib.timeout_add_seconds(30, _companion_watchdog)
     win = ControlPanel()
 
     # Close button hides to tray instead of quitting
