@@ -11,37 +11,37 @@ Tacho (Monitor), Bordcomputer (Hub), Fehlerlampen (Logs), Navigationsliste (Sess
 
 ---
 
-## Architektur — 7 Module
+## Architektur — 14 Module
 
-### panel.py (1321 Zeilen) — Der Dirigent
-Das Hauptfenster. Baut alle 7 Tabs zusammen, startet die Timer, verwaltet das Tray-Icon.
+### panel.py (2373 Zeilen) — Der Dirigent
+Das Hauptfenster. Baut alle Tabs zusammen, startet die Timer, verwaltet das Tray-Icon.
 Wie ein Dirigent: spielt selbst kein Instrument, aber koordiniert alle anderen.
 
 **Key:** `ControlPanel` Klasse mit `_build_*_tab()` Methoden, `_refresh_hub()`, `_refresh_monitor()`.
 
-### monitor.py (280 Zeilen) — Der Daten-Butler
+### monitor.py (729 Zeilen) — Der Daten-Butler
 Holt alle Zahlen: Kosten, Top-Tools, aktive Sessions, Timeline.
 Hat einen TTL-Cache (30 Sekunden) — fragt nicht staendig die Festplatte.
 
 **Key:** `get_daily_cost()`, `get_top_tools()`, `get_active_sessions()`. Nutzt MyAIGame's `tui.data.*` Module.
 
-### log_viewer.py (275 Zeilen) — Der Protokollant
+### log_viewer.py (435 Zeilen) — Der Protokollant
 Zeigt heutige Usage-Eintraege und Coaching-Log. Filterbar nach Tools/Errors/Hooks.
 
 **Key:** `build_logs_tab()`, `refresh_logs()`. Liest `~/.claude/usage/YYYY-MM-DD.jsonl`.
 
-### session_browser.py (379 Zeilen) — Das Telefonbuch
+### session_browser.py (1039 Zeilen) — Das Telefonbuch
 Alle Claude-Sessions durchsuchbar. Zeigt Projekt, Vorschau, Groesse. Resume-Button oeffnet kitty.
 
 **Key:** `build_sessions_tab()`, `_scan_all_sessions()`, `_on_resume_clicked()`.
 
-### process_manager.py (552 Zeilen) — Der Hausmeister
+### process_manager.py (588 Zeilen) — Der Hausmeister
 Scannt `ps aux` nach Claude-relevanten Prozessen. Zeigt RAM, CPU, Uptime.
 Kill-Button pro Prozess + "Kill All Ghosts" fuer Prozesse >24h.
 
 **Key:** `build_processes_tab()`, `_scan_processes()`, Ghost-Detection via `/proc/<pid>/stat`.
 
-### theme.py (320 Zeilen) — Der Maler
+### theme.py (620 Zeilen) — Der Maler
 Erkennt ob COSMIC Desktop dunkel oder hell ist, generiert passendes CSS.
 Catppuccin Mocha (dark) / Latte (light). Wechselt live wenn du das System-Theme aenderst.
 
@@ -54,18 +54,65 @@ Immer: Backup → Temp-Datei → `os.replace()`. So geht nie was kaputt.
 
 **Key:** `read_settings()`, `write_settings()`, `update_setting("key.path", value)`.
 
+### swarm_tab.py (974 Zeilen) — Der Lageplaner
+Zeigt die laufende Agent Team Pipeline in Echtzeit. Liest `~/.claude/teams/` und
+`~/.claude/tasks/` und stellt Scout→Weaver→Builder→Validator→Pruefer als Karten dar.
+
+**Key:** `build_swarm_tab()`, `_scan_teams()`, `_refresh_swarm()`.
+
+### swarm_visual.py (708 Zeilen) — Der Kartograf
+Generiert HTML-Seiten mit interaktiven Agent-Kommunikationsgraphen: Hub-and-Spoke-Layout,
+Bezier-Kurven, Partikel-Animationen. Wird von swarm_tab.py aufgerufen und in WebKit2 eingebettet.
+
+**Key:** `generate_swarm_html()`, Bezier + Partikel-Rendering via Canvas.
+
+### event_tab.py (426 Zeilen) — Der Horcher
+Live-Viewer fuer Hook-Events aus `~/.claude/events/YYYY-MM-DD.jsonl`. Filterbar
+nach Event-Typ, Auto-Scroll wenn neue Events reinkommen.
+
+**Key:** `build_events_tab()`, `_tail_events()`, Filter-Logik nach Typ/Quelle.
+
+### shortcut_counter_tab.py (450 Zeilen) — Der Strichlisten-Fuehrer
+Zeigt Keyboard-Shortcut-Statistiken aus der ShortcutCounter-Datenbank. Wie oft hast
+du Ctrl+C vs. Ctrl+Z genutzt? Welcher Shortcut spart am meisten Zeit?
+
+**Key:** `build_shortcut_tab()`, liest ShortcutCounter SQLite DB.
+
+### project_dashboard_tab.py (254 Zeilen) — Das Fenster
+Bettet das Project Dashboard als WebKit2-Webview direkt ins Panel ein, statt
+einen Browser oeffnen zu muessen. Ein Tab = ein komplettes Web-Dashboard.
+
+**Key:** `build_project_dashboard_tab()`, `WebKit2.WebView` Setup + Reload-Button.
+
+### utils.py (33 Zeilen) — Der Werkzeugkasten
+Kleine Hilfsfunktionen die ueberall gebraucht werden (Format-Helpers, Pfad-Utilities).
+Klein aber da wenn man ihn braucht.
+
+**Key:** Shared Utilities fuer alle anderen Module.
+
+### tools-gui/ (623 Zeilen) — Das Zweite Cockpit
+Separates GTK3-Fenster mit 3 eigenen Tabs: Kosten-Analyse, Session-Uebersicht, Tool-Statistiken.
+Laeuft als eigenstaendiges Fenster neben dem Hauptpanel (main.py + 3 Tab-Module).
+
+**Key:** `tools-gui/main.py` als Einstiegspunkt, 3 Tab-Module fuer costs/sessions/tools.
+
 ---
 
 ## Wie die Tabs zusammenhaengen
 
 ```
 panel.py (Dirigent)
-  ├── importiert monitor.py      → liefert Daten fuer Hub + Monitor Tab
-  ├── importiert log_viewer.py   → baut Logs Tab
+  ├── importiert monitor.py        → liefert Daten fuer Hub + Monitor Tab
+  ├── importiert log_viewer.py     → baut Logs Tab
   ├── importiert session_browser.py → baut Sessions Tab
   ├── importiert process_manager.py → baut Prozesse Tab
-  ├── importiert theme.py        → CSS + Theme Watcher
-  └── importiert config_io.py    → Settings + Hooks Tabs lesen/schreiben Config
+  ├── importiert swarm_tab.py      → baut Agent Swarm Tab
+  ├── importiert swarm_visual.py   → generiert Swarm-Graphen (HTML)
+  ├── importiert event_tab.py      → baut Events Tab
+  ├── importiert shortcut_counter_tab.py → baut Shortcut Counter Tab
+  ├── importiert project_dashboard_tab.py → baut Project Dashboard Tab (WebKit2)
+  ├── importiert theme.py          → CSS + Theme Watcher
+  └── importiert config_io.py      → Settings + Hooks Tabs lesen/schreiben Config
 ```
 
 Jedes Modul ist **eigenstaendig** — kann theoretisch allein funktionieren.
@@ -192,3 +239,7 @@ Das Panel laeuft. Diese Fixes machen es sauberer, nicht funktionsfaehiger.
 
 4. **COSMIC-only Theme Detection:** Auf nicht-COSMIC-Desktops funktioniert nur
    der GTK-Fallback. Die Catppuccin-Farben bleiben, aber Live-Switching nur per GTK.
+
+5. **Singleton Lock (GEFIXT):** Frueher konnten mehrere Panel-Instanzen gleichzeitig
+   laufen (systemd restart + manueller Start). Fix: `fcntl.flock` auf `/tmp/claude-panel.lock`.
+   Zweite Instanz erkennt Lock und beendet sich mit `sys.exit(0)`.
