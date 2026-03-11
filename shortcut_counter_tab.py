@@ -310,23 +310,32 @@ def _do_refresh() -> bool:
                         "category": cat_name,
                     })
 
-        mastered_cards = []
+        mastered_items: list[dict] = []  # collect individually mastered shortcuts
         for cat_name, cat_rows in sorted(categories.items()):
-            card = _build_category_card(cat_name, cat_rows, p)
-            # Category is "all mastered" if every item has count >= _MASTERED
-            all_mastered = all(r["count"] >= _MASTERED for r in cat_rows)
-            if all_mastered and cat_rows:
-                mastered_cards.append(card)
-            else:
+            learning = [r for r in cat_rows if r["count"] < _MASTERED]
+            mastered = [r for r in cat_rows if r["count"] >= _MASTERED]
+            # Tag mastered items with their category for the expander
+            for m in mastered:
+                m["_cat"] = cat_name
+                mastered_items.append(m)
+            # Only build a card if there are non-mastered items
+            if learning:
+                card = _build_category_card(cat_name, learning, p)
                 _cards_container.pack_start(card, False, False, 0)
 
-        if mastered_cards:
+        if mastered_items:
             expander = Gtk.Expander()
-            expander.set_label(f"Mastered ({len(mastered_cards)} Kategorien)")
+            expander.set_label(f"Mastered ({len(mastered_items)} Shortcuts)")
             expander.set_expanded(False)
             exp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            for mc in mastered_cards:
-                exp_box.pack_start(mc, False, False, 0)
+            # Group mastered items by category inside the expander
+            from itertools import groupby
+            for cat, items in groupby(
+                sorted(mastered_items, key=lambda r: r.get("_cat", "")),
+                key=lambda r: r.get("_cat", ""),
+            ):
+                cat_card = _build_category_card(cat, list(items), p)
+                exp_box.pack_start(cat_card, False, False, 0)
             expander.add(exp_box)
             _cards_container.pack_start(expander, False, False, 0)
 
