@@ -1916,6 +1916,7 @@ class ControlPanel(Gtk.Window):
                     slot["name"].set_markup(f'<span foreground="#cba6f7"><b>/{sk}</b></span>')
                     slot["today"].set_text(f"{t_cnt}x heute" if t_cnt > 0 else "—")
                     slot["week"].set_text(f"{w_cnt}x/Wo")
+                    slot["row"].set_no_show_all(False)
                     slot["row"].show_all()
                 else:
                     slot["row"].hide()
@@ -1934,11 +1935,12 @@ class ControlPanel(Gtk.Window):
                     slot["info"].set_text(
                         f'{t["calls"]} calls  ${t["cost_est"]:.3f}'
                     )
+                    slot["row"].set_no_show_all(False)
                     slot["row"].show_all()
                 else:
                     slot["row"].hide()
         except Exception:
-            log.exception("monitor slot visibility")
+            log.exception("cost refresh failed")
         return True
 
     # -----------------------------------------------------------------------
