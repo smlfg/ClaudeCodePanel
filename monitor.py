@@ -586,13 +586,10 @@ def get_provider_costs() -> dict[str, float]:
     # 1. Anthropic: per-model costs from session JSONLs
     anthropic = get_anthropic_session_cost()
     costs: dict[str, float] = {}
-    anthropic_total = 0.0
     for tier in ("opus", "sonnet", "haiku"):
-        model_data = anthropic.get("models", {}).get(tier, {})
-        tier_cost = model_data.get("cost_usd", 0.0)
-        anthropic_total += tier_cost
-    if anthropic_total > 0:
-        costs["anthropic"] = anthropic_total
+        tier_cost = anthropic.get("models", {}).get(tier, {}).get("cost_usd", 0.0)
+        if tier_cost > 0:
+            costs[tier] = tier_cost
 
     # 2. Other providers: from providers.jsonl
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
