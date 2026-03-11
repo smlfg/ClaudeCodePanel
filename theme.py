@@ -539,6 +539,28 @@ notebook tab:checked {{
 .session-row-search {{
     border-left: 3px solid {p["accent"]};
 }}
+
+/* --- Monitor Tab Enhancements --- */
+.mon-tool-bar {{
+    min-height: 8px;
+}}
+.mon-tool-bar trough {{
+    min-height: 8px;
+    background: {p["border"]};
+    border-radius: 4px;
+}}
+.mon-tool-bar progress {{
+    min-height: 8px;
+    background: {p["accent"]};
+    border-radius: 4px;
+}}
+.mon-expander {{
+    color: {p["subtext1"]};
+    font-size: 11px;
+}}
+.mon-expander title {{
+    color: {p["subtext1"]};
+}}
 """.encode()
 
 

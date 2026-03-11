@@ -48,12 +48,27 @@ from monitor import (
 from log_viewer import build_logs_tab, refresh_logs
 from session_browser import build_sessions_tab, refresh_sessions, _scan_all_sessions
 from process_manager import build_processes_tab, refresh_processes
-from theme import build_css, setup_theme_watcher
+from theme import build_css, setup_theme_watcher, get_palette
 from utils import idle_once
 from swarm_tab import build_swarm_tab, refresh_swarm
 from shortcut_counter_tab import build_shortcut_counter_tab, refresh_shortcut_counter
 from project_dashboard_tab import build_project_dashboard_tab, refresh_project_dashboard
 from event_tab import build_events_tab, refresh_events
+
+
+# ---------------------------------------------------------------------------
+# Monitor Tab helpers
+# ---------------------------------------------------------------------------
+_PROVIDER_COLORS = {"anthropic": "mauve", "gemini": "teal", "minimax": "peach"}
+
+
+def _hex_rgb(hex_color: str) -> tuple[float, float, float]:
+    """Convert #rrggbb to (r, g, b) floats 0-1."""
+    return (
+        int(hex_color[1:3], 16) / 255,
+        int(hex_color[3:5], 16) / 255,
+        int(hex_color[5:7], 16) / 255,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1329,6 +1344,24 @@ class ControlPanel(Gtk.Window):
         self._mon_cost_sub.set_xalign(0)
         self._mon_cost_sub.get_style_context().add_class("stat-sublabel")
         cost_card.pack_start(self._mon_cost_sub, False, False, 0)
+
+        # Yesterday label
+        self._mon_cost_yesterday = Gtk.Label(label="")
+        self._mon_cost_yesterday.set_xalign(0)
+        self._mon_cost_yesterday.get_style_context().add_class("stat-sublabel")
+        cost_card.pack_start(self._mon_cost_yesterday, False, False, 0)
+
+        # Sparkline (7-day cost trend)
+        self._sparkline_data = []
+        self._sparkline_area = Gtk.DrawingArea()
+        self._sparkline_area.set_size_request(120, 24)
+        self._sparkline_area.connect("draw", self._draw_sparkline)
+        cost_card.pack_start(self._sparkline_area, False, False, 2)
+
+        # Provider segment bar
+        self._mon_provider_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        cost_card.pack_start(self._mon_provider_box, False, False, 0)
+
         top_row.pack_start(cost_card, True, True, 0)
 
         # Sessions card
@@ -1365,22 +1398,55 @@ class ControlPanel(Gtk.Window):
         self._mon_mech_sub.set_xalign(0)
         self._mon_mech_sub.get_style_context().add_class("stat-sublabel")
         mech_card.pack_start(self._mon_mech_sub, False, False, 0)
+
+        # Severity buckets
+        self._mon_sev_labels = {}
+        self._mon_sev_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        for sev in ("critical", "warning", "info"):
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+            dot = Gtk.Label(label="●")
+            dot.get_style_context().add_class(f"watcher-dot-{sev}")
+            hb.pack_start(dot, False, False, 0)
+            lbl = Gtk.Label(label=f"{sev.title()}: 0")
+            lbl.get_style_context().add_class("stat-sublabel")
+            hb.pack_start(lbl, False, False, 0)
+            self._mon_sev_labels[sev] = lbl
+            self._mon_sev_box.pack_start(hb, False, False, 0)
+        mech_card.pack_start(self._mon_sev_box, False, False, 0)
+
         vbox.pack_start(mech_card, False, False, 0)
 
         # --- Tools + Skills row ---
         bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         bottom_row.set_homogeneous(True)
 
-        # Top Tools card
+        # Top Tools card (ProgressBar slots)
         tools_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         tools_card.get_style_context().add_class("signal-card")
         tools_title = Gtk.Label(label="Top Tools", xalign=0)
         tools_title.get_style_context().add_class("stat-sublabel")
         tools_card.pack_start(tools_title, False, False, 0)
-        self._mon_tools_label = Gtk.Label(label="Keine Daten")
-        self._mon_tools_label.set_xalign(0)
-        self._mon_tools_label.get_style_context().add_class("monitor-value")
-        tools_card.pack_start(self._mon_tools_label, False, False, 0)
+        self._mon_tool_slots = []
+        for _ in range(5):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            name_lbl = Gtk.Label(label="")
+            name_lbl.set_xalign(0)
+            name_lbl.set_width_chars(8)
+            name_lbl.get_style_context().add_class("watcher-name")
+            row.pack_start(name_lbl, False, False, 0)
+            bar = Gtk.ProgressBar()
+            bar.set_fraction(0)
+            bar.get_style_context().add_class("mon-tool-bar")
+            row.pack_start(bar, True, True, 0)
+            count_lbl = Gtk.Label(label="")
+            count_lbl.set_xalign(1)
+            count_lbl.set_width_chars(5)
+            count_lbl.get_style_context().add_class("stat-sublabel")
+            row.pack_start(count_lbl, False, False, 0)
+            tools_card.pack_start(row, False, False, 0)
+            row.set_no_show_all(True)
+            self._mon_tool_slots.append((row, name_lbl, bar, count_lbl))
+        tools_card.pack_start(Gtk.Label(), False, False, 0)  # empty fallback hidden by default
         bottom_row.pack_start(tools_card, True, True, 0)
 
         # Missed Skills card
@@ -1395,7 +1461,13 @@ class ControlPanel(Gtk.Window):
         skills_card.pack_start(self._mon_skills_label, False, False, 0)
         bottom_row.pack_start(skills_card, True, True, 0)
 
-        vbox.pack_start(bottom_row, False, False, 0)
+        # Detail expander (collapsed by default)
+        self._mon_expander = Gtk.Expander()
+        self._mon_expander.set_label("Tools & Skills")
+        self._mon_expander.get_style_context().add_class("mon-expander")
+        self._mon_expander.set_expanded(False)
+        self._mon_expander.add(bottom_row)
+        vbox.pack_start(self._mon_expander, False, False, 0)
 
         scrolled.add(vbox)
         self.notebook.append_page(scrolled, Gtk.Label(label="Monitor"))
@@ -1415,6 +1487,34 @@ class ControlPanel(Gtk.Window):
             else:
                 self._mon_cost_value.set_text("N/A")
                 self._mon_cost_sub.set_text(cost_data.get("error", ""))
+
+            # Sparkline + yesterday
+            timeline = get_usage_timeline()
+            self._sparkline_data = timeline
+            self._sparkline_area.queue_draw()
+            if len(timeline) >= 2:
+                yesterday_cost = timeline[1].get("cost_est", 0)
+                self._mon_cost_yesterday.set_text(f"gestern: {format_cost(yesterday_cost)}")
+            else:
+                self._mon_cost_yesterday.set_text("")
+
+            # Provider segments
+            for child in self._mon_provider_box.get_children():
+                self._mon_provider_box.remove(child)
+            p = get_palette()
+            prov_costs = get_provider_costs()
+            if prov_costs:
+                for prov, cost_val in sorted(prov_costs.items(), key=lambda x: -x[1])[:4]:
+                    color_key = _PROVIDER_COLORS.get(prov, "dim")
+                    color = p.get(color_key, p["dim"])
+                    initial = prov[0].upper()
+                    lbl = Gtk.Label()
+                    lbl.set_markup(
+                        f'<span foreground="{color}" font_family="monospace" font_size="9000">'
+                        f'{initial} {format_cost(cost_val)}</span>'
+                    )
+                    self._mon_provider_box.pack_start(lbl, False, False, 0)
+                self._mon_provider_box.show_all()
 
             # Sessions
             sessions = get_active_sessions()
@@ -1468,13 +1568,31 @@ class ControlPanel(Gtk.Window):
                 else:
                     self._mon_mech_sub.set_text(f"{active_count}/{total} aktiv")
 
-            # Top Tools
+            # Severity buckets
+            counts = {"critical": 0, "warning": 0, "info": 0}
+            if running:
+                for det_info in sidecar.get("detectors", {}).values():
+                    if det_info.get("active"):
+                        sev = det_info.get("severity", "info")
+                        counts[sev] = counts.get(sev, 0) + 1
+            for sev, cnt in counts.items():
+                if sev in self._mon_sev_labels:
+                    self._mon_sev_labels[sev].set_text(f"{sev.title()}: {cnt}")
+
+            # Top Tools (ProgressBar slots)
             tools = get_top_tools(5)
-            if tools:
-                lines = [f"{name}: {count}x" for name, count in tools]
-                self._mon_tools_label.set_text("\n".join(lines))
-            else:
-                self._mon_tools_label.set_text("Keine Daten")
+            max_count = tools[0][1] if tools else 1
+            for i, (row, name_lbl, bar, count_lbl) in enumerate(self._mon_tool_slots):
+                if i < len(tools):
+                    name, count = tools[i]
+                    name_lbl.set_text(name)
+                    bar.set_fraction(count / max(max_count, 1))
+                    count_lbl.set_text(f"{count}x")
+                    row.set_no_show_all(False)
+                    row.show_all()
+                else:
+                    row.hide()
+                    row.set_no_show_all(True)
 
             # Missed Skills
             missed = get_missed_skills_summary()
@@ -1483,9 +1601,66 @@ class ControlPanel(Gtk.Window):
                 self._mon_skills_label.set_text("\n".join(lines))
             else:
                 self._mon_skills_label.set_text("Keine verpassten Skills heute")
+
+            # Update expander header
+            top_tool = tools[0] if tools else None
+            missed_count = len(missed) if missed else 0
+            header_parts = []
+            if top_tool:
+                header_parts.append(f"Tools: {top_tool[0]} {top_tool[1]}x")
+            if missed_count:
+                header_parts.append(f"Skills: {missed_count} verpasst")
+            self._mon_expander.set_label(" | ".join(header_parts) if header_parts else "Tools & Skills")
         except Exception:
             log.exception("monitor refresh")
         return True  # keep 30s timer alive
+
+    def _draw_sparkline(self, widget, cr):
+        """Draw 7-day cost sparkline using Cairo."""
+        p = get_palette()
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+        data = self._sparkline_data
+
+        if len(data) < 2:
+            cr.set_source_rgba(*_hex_rgb(p["dim"]), 0.3)
+            cr.select_font_face("monospace", 0, 0)
+            cr.set_font_size(9)
+            cr.move_to(4, height / 2 + 3)
+            cr.show_text("—")
+            return False
+
+        costs = [d.get("cost_est", 0) for d in reversed(data)]  # oldest first
+        max_c = max(costs) or 0.01
+        n = len(costs)
+        step = width / max(n - 1, 1)
+
+        # Build points
+        points = []
+        for i, c in enumerate(costs):
+            x = i * step
+            y = height - 2 - (c / max_c) * (height - 4)
+            points.append((x, y))
+
+        # Fill area under the line
+        r, g, b = _hex_rgb(p["accent"])
+        cr.move_to(points[0][0], height)
+        for x, y in points:
+            cr.line_to(x, y)
+        cr.line_to(points[-1][0], height)
+        cr.close_path()
+        cr.set_source_rgba(r, g, b, 0.15)
+        cr.fill()
+
+        # Polyline
+        cr.set_source_rgba(r, g, b, 0.8)
+        cr.set_line_width(1.5)
+        cr.move_to(*points[0])
+        for x, y in points[1:]:
+            cr.line_to(x, y)
+        cr.stroke()
+
+        return False
 
     # -----------------------------------------------------------------------
     # Tab 5: Cost — Provider breakdown + usage timeline
