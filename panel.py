@@ -8,9 +8,12 @@ Performance: Fixed label widgets (no rebuild), separate timers for Hub/Monitor,
 data fetching via GLib.idle_add for non-blocking UI.
 """
 
+import fcntl
 import logging
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 import gi
 
@@ -2322,7 +2325,25 @@ def _companion_watchdog():
     return True  # keep timer running
 
 
+_lock_file = None
+
+
+def _acquire_singleton_lock():
+    """Ensure only one panel instance runs at a time."""
+    global _lock_file
+    lock_path = Path("/tmp/claude-panel.lock")
+    _lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.write(str(os.getpid()))
+        _lock_file.flush()
+    except BlockingIOError:
+        log.warning("Panel already running — exiting duplicate instance.")
+        sys.exit(0)
+
+
 def main():
+    _acquire_singleton_lock()
     _ensure_companion_panel()
     GLib.timeout_add_seconds(30, _companion_watchdog)
     win = ControlPanel()
