@@ -2301,6 +2301,18 @@ def main():
     indicator = _build_tray_indicator(win)
 
     win.show_all()
+
+    # Move to portrait monitor if available
+    display = Gdk.Display.get_default()
+    if display:
+        n_monitors = display.get_n_monitors()
+        for i in range(n_monitors):
+            mon = display.get_monitor(i)
+            geo = mon.get_geometry()
+            if geo.width < geo.height:  # portrait mode
+                win.move(geo.x + 20, geo.y + 20)
+                break
+
     Gtk.main()
 
 
