@@ -310,9 +310,25 @@ def _do_refresh() -> bool:
                         "category": cat_name,
                     })
 
+        mastered_cards = []
         for cat_name, cat_rows in sorted(categories.items()):
             card = _build_category_card(cat_name, cat_rows, p)
-            _cards_container.pack_start(card, False, False, 0)
+            # Category is "all mastered" if every item has count >= _MASTERED
+            all_mastered = all(r["count"] >= _MASTERED for r in cat_rows)
+            if all_mastered and cat_rows:
+                mastered_cards.append(card)
+            else:
+                _cards_container.pack_start(card, False, False, 0)
+
+        if mastered_cards:
+            expander = Gtk.Expander()
+            expander.set_label(f"Mastered ({len(mastered_cards)} Kategorien)")
+            expander.set_expanded(False)
+            exp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            for mc in mastered_cards:
+                exp_box.pack_start(mc, False, False, 0)
+            expander.add(exp_box)
+            _cards_container.pack_start(expander, False, False, 0)
 
         _cards_container.show_all()
 
