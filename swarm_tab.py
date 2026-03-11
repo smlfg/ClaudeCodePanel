@@ -82,9 +82,13 @@ def _load_teams() -> list[dict]:
                 for tf in task_dir.glob("*.json"):
                     try:
                         td = json.loads(tf.read_text(encoding="utf-8"))
+                        if td.get("metadata", {}).get("_internal"):
+                            continue
                         task_count += 1
                         if td.get("status") == "in_progress":
-                            active_tasks += 1
+                            mtime = tf.stat().st_mtime
+                            if (time.time() - mtime) < 7200:  # 2h
+                                active_tasks += 1
                     except (json.JSONDecodeError, OSError):
                         pass
             teams.append({
