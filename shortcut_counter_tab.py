@@ -116,7 +116,7 @@ def _fmt_last_used(last_used) -> str:
 def _find_category(combo: str, config: dict[str, list[dict]]) -> str:
     """Try to find category for a combo via config dict."""
     for cat_name, items in config.items():
-        if any(it["combo"] == combo for it in items):
+        if any(it["combo"].lower() == combo.lower() for it in items):
             return cat_name
     return "Sonstige"
 
@@ -284,9 +284,9 @@ def _do_refresh() -> bool:
         for child in _cards_container.get_children():
             _cards_container.remove(child)
 
-        # Build desc lookup: combo -> desc from config
+        # Build desc lookup: combo -> desc from config (case-insensitive)
         desc_lookup: dict[str, str] = {
-            it["combo"]: it["desc"] for it in all_config_items
+            it["combo"].lower(): it["desc"] for it in all_config_items
         }
 
         # Group DB rows by category, enriching with desc from config
@@ -294,14 +294,14 @@ def _do_refresh() -> bool:
         for r in rows:
             cat = r.get("category") or "Sonstige"
             enriched = dict(r)
-            enriched["desc"] = desc_lookup.get(r["combo"], "")
+            enriched["desc"] = desc_lookup.get(r["combo"].lower(), "")
             categories.setdefault(cat, []).append(enriched)
 
         # Add config items never used (not in DB)
-        db_combos = {r["combo"] for r in rows}
+        db_combos = {r["combo"].lower() for r in rows}
         for cat_name, items in config.items():
             for it in items:
-                if it["combo"] not in db_combos:
+                if it["combo"].lower() not in db_combos:
                     categories.setdefault(cat_name, []).append({
                         "combo": it["combo"],
                         "desc": it["desc"],
@@ -355,11 +355,11 @@ def _do_refresh() -> bool:
         lbl.set_margin_bottom(4)
         _learn_box.pack_start(lbl, False, False, 0)
 
-        db_combos = {r["combo"] for r in rows}
+        db_combos = {r["combo"].lower() for r in rows}
         unused = [
             it for it in all_config_items
-            if it["combo"] not in db_combos
-            or next((r["count"] for r in rows if r["combo"] == it["combo"]), 0) == 0
+            if it["combo"].lower() not in db_combos
+            or next((r["count"] for r in rows if r["combo"].lower() == it["combo"].lower()), 0) == 0
         ]
 
         if unused:
