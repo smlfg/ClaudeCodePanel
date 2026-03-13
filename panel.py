@@ -57,6 +57,7 @@ from swarm_tab import build_swarm_tab, refresh_swarm
 from shortcut_counter_tab import build_shortcut_counter_tab, refresh_shortcut_counter
 from project_dashboard_tab import build_project_dashboard_tab, refresh_project_dashboard
 from event_tab import build_events_tab, refresh_events
+from brightness_tab import build_brightness_tab, refresh_brightness
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +384,7 @@ class ControlPanel(Gtk.Window):
         self.notebook.append_page(build_shortcut_counter_tab(), Gtk.Label(label="Shortcuts"))
         self.notebook.append_page(build_project_dashboard_tab(), Gtk.Label(label="Projekte"))
         self.notebook.append_page(build_events_tab(), Gtk.Label(label="Events"))
+        self.notebook.append_page(build_brightness_tab(), Gtk.Label(label="Sonnenuhr"))
 
         # Bottom status bar
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -419,6 +421,7 @@ class ControlPanel(Gtk.Window):
         GLib.timeout_add_seconds(30, refresh_shortcut_counter)
         GLib.timeout_add_seconds(30, refresh_project_dashboard)
         GLib.timeout_add_seconds(2, refresh_events)
+        GLib.timeout_add_seconds(10, refresh_brightness)
 
     def _start_monitor_timer(self) -> bool:
         """One-shot: starts the 30s monitor timer (offset from hub by 15s)."""
@@ -2298,25 +2301,58 @@ def _build_tray_indicator(win: ControlPanel) -> AyatanaAppIndicator3.Indicator:
 
 
 def _ensure_companion_panel():
-    """Start Sidecar Panel if not already running. Max 1 instance."""
+    """Start Sidecar Panel if not already running.
+
+    Uses atomic spawn guard (O_CREAT|O_EXCL) to prevent race conditions.
+    The guard file is cleaned up after 60s by a one-shot timer.
+    """
     companion = Path.home() / "Projekte" / "Sidecar" / "gui" / "main.py"
+    companion_lock = "/tmp/sidecar-panel.lock"
+    spawn_guard = "/tmp/sidecar-panel.spawning"
     if not companion.exists():
         return
+
+    # Check if companion holds its flock
     try:
-        result = subprocess.run(
-            ["pgrep", "-cf", f"python3 {companion}"],
-            capture_output=True, timeout=2, text=True,
+        fd = os.open(companion_lock, os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Got the lock → companion is NOT running → release and spawn
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except BlockingIOError:
+            os.close(fd)
+            return  # companion is alive
+        os.close(fd)
+    except OSError:
+        return
+
+    # Atomic spawn guard — prevents double-spawn from autostart + watchdog
+    try:
+        guard_fd = os.open(spawn_guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(guard_fd)
+    except FileExistsError:
+        return  # someone else is already spawning
+    except OSError:
+        return
+
+    try:
+        subprocess.Popen(
+            ["python3", str(companion)],
+            cwd=str(companion.parent),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        count = int(result.stdout.strip() or "0")
-        if count == 0:
-            subprocess.Popen(
-                ["python3", str(companion)],
-                cwd=str(companion.parent),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
     except Exception:
         pass
+
+    # Clean up spawn guard after 60s (companion should have its lock by then)
+    def _cleanup_guard():
+        try:
+            os.unlink(spawn_guard)
+        except OSError:
+            pass
+        return False
+    GLib.timeout_add_seconds(60, _cleanup_guard)
 
 
 def _companion_watchdog():
@@ -2329,12 +2365,18 @@ _lock_file = None
 
 
 def _acquire_singleton_lock():
-    """Ensure only one panel instance runs at a time."""
+    """Ensure only one panel instance runs at a time.
+
+    Uses flock only — auto-released on crash, no PID check needed.
+    Opens with O_CREAT|O_WRONLY to avoid inode races from unlink+recreate.
+    """
     global _lock_file
-    lock_path = Path("/tmp/claude-panel.lock")
-    _lock_file = open(lock_path, "w")
+    lock_path = "/tmp/claude-panel.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o644)
+    _lock_file = os.fdopen(fd, "w")
     try:
         fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.truncate(0)
         _lock_file.write(str(os.getpid()))
         _lock_file.flush()
     except BlockingIOError:
