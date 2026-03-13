@@ -6,11 +6,13 @@ Gracefully falls back when data sources are unavailable.
 Performance: TTL cache (30s) prevents redundant disk I/O.
 Single combined scan for active + recent sessions.
 Session previews cached permanently (content never changes).
+Sidecar socket queries refresh asynchronously to avoid blocking GTK.
 """
 
 import importlib.util
 import json
 import logging
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -71,6 +73,10 @@ _CACHE_TTL_SECONDS = 30
 _cache = {}       # key -> value
 _cache_ts = {}    # key -> timestamp
 _preview_cache = {}  # path_str -> preview text (permanent, content never changes)
+_sidecar_lock = threading.Lock()
+_sidecar_refresh_in_flight = False
+_jsonl_scan_lock = threading.Lock()
+_jsonl_scan_in_flight = False
 
 
 def _cache_get(key):
@@ -105,7 +111,51 @@ DEFAULT_PRICING = (5.00, 6.25, 0.50, 25.0)  # Opus as conservative fallback
 # ---------------------------------------------------------------------------
 # Combined JSONL scanner — single pass for tokens + skills (cached 30s)
 # ---------------------------------------------------------------------------
+def _default_jsonl_scan() -> dict:
+    """Return empty result structure for JSONL scan."""
+    return {"tokens_by_date": {}, "models_by_date": {}, "skills_by_date": {}}
+
+
+def _do_jsonl_scan(days: int, cache_key: str) -> None:
+    """Heavy JSONL scan — runs in background thread, stores result in cache."""
+    global _jsonl_scan_in_flight
+    try:
+        result = _do_jsonl_scan_inner(days)
+        _cache_set(cache_key, result)
+    except Exception:
+        log.exception("background JSONL scan failed")
+    finally:
+        with _jsonl_scan_lock:
+            _jsonl_scan_in_flight = False
+
+
 def _scan_session_jsonls(days: int = 1) -> dict:
+    """Non-blocking JSONL scan. Returns cached/stale data immediately,
+    kicks off background thread on cache miss (like get_sidecar_status).
+    """
+    global _jsonl_scan_in_flight
+
+    cache_key = f"jsonl_scan_{days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    stale = _cache.get(cache_key, _default_jsonl_scan())
+
+    with _jsonl_scan_lock:
+        if not _jsonl_scan_in_flight:
+            _jsonl_scan_in_flight = True
+            threading.Thread(
+                target=_do_jsonl_scan,
+                args=(days, cache_key),
+                daemon=True,
+                name="claude-panel-jsonl-scan",
+            ).start()
+
+    return stale
+
+
+def _do_jsonl_scan_inner(days: int = 1) -> dict:
     """Single-pass scan of session JSONLs for tokens AND skills.
 
     Returns: {
@@ -113,11 +163,6 @@ def _scan_session_jsonls(days: int = 1) -> dict:
         "skills_by_date": {"2026-03-03": {"research": 3, "chef": 5}},
     }
     """
-    cache_key = f"jsonl_scan_{days}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
     from collections import defaultdict
 
     now = time.time()
@@ -132,9 +177,7 @@ def _scan_session_jsonls(days: int = 1) -> dict:
     sessions_by_date = defaultdict(set)
 
     if not PROJECTS_DIR.exists():
-        result = {"tokens_by_date": dict(tokens_by_date), "skills_by_date": {k: dict(v) for k, v in skills_by_date.items()}}
-        _cache_set(cache_key, result)
-        return result
+        return _default_jsonl_scan()
 
     # Collect last usage per requestId to avoid streaming duplication.
     # Streaming responses emit multiple usage objects per request — only
@@ -251,13 +294,11 @@ def _scan_session_jsonls(days: int = 1) -> dict:
     for d, model_map in tokens_by_date_model.items():
         models_dict[d] = {tier: dict(b) for tier, b in model_map.items()}
 
-    result = {
+    return {
         "tokens_by_date": tokens_dict,
         "models_by_date": models_dict,
         "skills_by_date": {k: dict(v) for k, v in skills_by_date.items()},
     }
-    _cache_set(cache_key, result)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -641,14 +682,8 @@ def _category_to_severity(category: str) -> str:
     return "info"
 
 
-def get_sidecar_status() -> dict:
-    """Query Sidecar V6 daemon via Unix socket."""
-    cache_key = "sidecar_status"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    result = {
+def _default_sidecar_status() -> dict:
+    return {
         "running": False,
         "sessions": 0,
         "active_findings": [],
@@ -659,9 +694,12 @@ def get_sidecar_status() -> dict:
         "phase": "",
     }
 
+
+def _query_sidecar_status() -> dict:
+    """Query Sidecar V6 daemon via Unix socket (blocking worker helper)."""
+    result = _default_sidecar_status()
     sock_path = Path("/tmp/sidecar-v6.sock")
     if not sock_path.exists():
-        _cache_set(cache_key, result, ttl=10)
         return result
 
     try:
@@ -669,7 +707,9 @@ def get_sidecar_status() -> dict:
 
         def _query(request: dict) -> dict:
             s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
-            s.settimeout(2.0)
+            # Keep timeouts tight so a wedged sidecar cannot pile up worker
+            # threads even though we no longer block GTK.
+            s.settimeout(0.75)
             try:
                 s.connect(str(sock_path))
                 s.sendall(json.dumps(request).encode())
@@ -725,5 +765,38 @@ def get_sidecar_status() -> dict:
     except Exception:
         log.exception("sidecar v6 query")
 
-    _cache_set(cache_key, result, ttl=10)
     return result
+
+
+def _refresh_sidecar_status_async(cache_key: str) -> None:
+    """Refresh sidecar status in a background thread."""
+    global _sidecar_refresh_in_flight
+    try:
+        _cache_set(cache_key, _query_sidecar_status(), ttl=10)
+    finally:
+        with _sidecar_lock:
+            _sidecar_refresh_in_flight = False
+
+
+def get_sidecar_status() -> dict:
+    """Return the latest known Sidecar V6 status without blocking GTK."""
+    global _sidecar_refresh_in_flight
+
+    cache_key = "sidecar_status"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    stale = _cache.get(cache_key, _default_sidecar_status())
+
+    with _sidecar_lock:
+        if not _sidecar_refresh_in_flight:
+            _sidecar_refresh_in_flight = True
+            threading.Thread(
+                target=_refresh_sidecar_status_async,
+                args=(cache_key,),
+                daemon=True,
+                name="claude-panel-sidecar",
+            ).start()
+
+    return stale

@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -474,13 +475,35 @@ def _populate_list_box(processes: list[dict]) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def refresh_processes() -> bool:
-    """Re-scan processes and update UI. Returns True to keep GLib timer alive."""
+_refresh_in_flight = False
+_refresh_lock = threading.Lock()
+
+
+def _refresh_processes_thread() -> None:
+    """Scan processes in background thread, push result to GTK via idle_add."""
+    global _refresh_in_flight
     try:
         processes = _scan_processes()
         GLib.idle_add(_populate_list_box, processes)
     except Exception:
-        log.exception("refresh processes")
+        log.exception("refresh processes (background)")
+    finally:
+        with _refresh_lock:
+            _refresh_in_flight = False
+
+
+def refresh_processes() -> bool:
+    """Re-scan processes in background thread. Returns True to keep GLib timer alive."""
+    global _refresh_in_flight
+    with _refresh_lock:
+        if _refresh_in_flight:
+            return True
+        _refresh_in_flight = True
+    threading.Thread(
+        target=_refresh_processes_thread,
+        daemon=True,
+        name="claude-panel-process-scan",
+    ).start()
     return True  # keep timer running
 
 
