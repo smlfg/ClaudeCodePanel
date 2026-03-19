@@ -386,6 +386,22 @@ class ControlPanel(Gtk.Window):
         self.notebook.append_page(build_events_tab(), Gtk.Label(label="Events"))
         self.notebook.append_page(build_brightness_tab(), Gtk.Label(label="Sonnenuhr"))
 
+        # Tab-Index → Refresh-Funktion Mapping
+        self._tab_refreshers = {
+            0: self._refresh_hub,
+            3: self._refresh_monitor,
+            4: self._refresh_cost,
+            5: refresh_logs,
+            6: refresh_sessions,
+            7: refresh_processes,
+            8: refresh_swarm,
+            9: refresh_shortcut_counter,
+            10: refresh_project_dashboard,
+            11: refresh_events,
+            12: refresh_brightness,
+        }
+        self.notebook.connect("switch-page", self._on_tab_switched)
+
         # Bottom status bar
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         status_bar.get_style_context().add_class("status-bar")
@@ -410,24 +426,36 @@ class ControlPanel(Gtk.Window):
 
         vbox.pack_start(status_bar, False, False, 0)
 
-        # Separate timers — Hub 30s, Monitor 30s offset by 15s, Logs 10s, Sessions 60s
+        # Guarded timers — only refresh when tab is visible
         GLib.timeout_add_seconds(30, self._refresh_hub)
         GLib.timeout_add_seconds(15, self._start_monitor_timer)
-        GLib.timeout_add_seconds(10, refresh_logs)
-        GLib.timeout_add_seconds(60, refresh_sessions)
-        GLib.timeout_add_seconds(30, refresh_processes)
+        GLib.timeout_add_seconds(10, self._guarded_refresh, 5, refresh_logs)
+        GLib.timeout_add_seconds(30, self._guarded_refresh, 6, refresh_sessions)
+        GLib.timeout_add_seconds(30, self._guarded_refresh, 7, refresh_processes)
         GLib.timeout_add_seconds(30, self._refresh_cost)
-        GLib.timeout_add_seconds(30, refresh_swarm)
-        GLib.timeout_add_seconds(30, refresh_shortcut_counter)
-        GLib.timeout_add_seconds(30, refresh_project_dashboard)
-        GLib.timeout_add_seconds(2, refresh_events)
-        GLib.timeout_add_seconds(10, refresh_brightness)
+        GLib.timeout_add_seconds(30, self._guarded_refresh, 8, refresh_swarm)
+        GLib.timeout_add_seconds(30, self._guarded_refresh, 9, refresh_shortcut_counter)
+        GLib.timeout_add_seconds(30, self._guarded_refresh, 10, refresh_project_dashboard)
+        GLib.timeout_add_seconds(2, self._guarded_refresh, 11, refresh_events)
+        GLib.timeout_add_seconds(10, self._guarded_refresh, 12, refresh_brightness)
 
     def _start_monitor_timer(self) -> bool:
         """One-shot: starts the 30s monitor timer (offset from hub by 15s)."""
         GLib.timeout_add_seconds(30, self._refresh_monitor)
         self._refresh_monitor()
         return False  # don't repeat this one-shot
+
+    def _guarded_refresh(self, page_idx, func):
+        """Only refresh when tab is visible."""
+        if self.notebook.get_current_page() != page_idx:
+            return True
+        return func()
+
+    def _on_tab_switched(self, notebook, page, page_num):
+        """Refresh tab immediately on switch."""
+        refresher = self._tab_refreshers.get(page_num)
+        if refresher:
+            GLib.idle_add(refresher)
 
     # -----------------------------------------------------------------------
     # Tab 1: Hub — Dashboard, Sessions, Shortcuts
@@ -826,6 +854,8 @@ class ControlPanel(Gtk.Window):
 
     def _refresh_hub(self) -> bool:
         """Refresh hub tab data. Updates fixed labels — no widget rebuild."""
+        if self.notebook.get_current_page() != 0:
+            return True
         try:
             # Quick stats
             cost_data = get_daily_cost()
@@ -1482,6 +1512,8 @@ class ControlPanel(Gtk.Window):
 
     def _refresh_monitor(self) -> bool:
         """Refresh monitor tab with signal cards."""
+        if self.notebook.get_current_page() != 3:
+            return True
         try:
             # Cost
             cost_data = get_daily_cost()
@@ -1850,6 +1882,8 @@ class ControlPanel(Gtk.Window):
 
     def _refresh_cost(self) -> bool:
         """Refresh cost tab data with real token-based costs."""
+        if self.notebook.get_current_page() != 4:
+            return True
         try:
             cost_data = get_daily_cost()
             if "error" not in cost_data:
