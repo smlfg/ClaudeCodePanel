@@ -110,6 +110,42 @@ def test_load_rows_with_db():
 
 
 # ---------------------------------------------------------------------------
+# Test 3b: _load_rows — TIMESTAMP column with ISO "T" values
+# ---------------------------------------------------------------------------
+
+def test_load_rows_timestamp_iso_values():
+    """_load_rows must tolerate TIMESTAMP columns storing ISO strings."""
+    import shortcut_counter_tab as sct
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = Path(f.name)
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE shortcuts "
+            "(combo TEXT, count INTEGER, first_seen TIMESTAMP, last_used TIMESTAMP, category TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO shortcuts (combo, count, first_seen, last_used, category) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("Super+L", 10, "2026-04-03T18:00:00", "2026-04-03T18:10:00", "COSMIC"),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch.object(sct, "_DB_PATH", db_path):
+            rows = sct._load_rows()
+
+        assert len(rows) == 1, f"Expected 1 row, got {len(rows)}"
+        assert rows[0]["combo"] == "Super+L"
+        assert rows[0]["last_used"] == "2026-04-03T18:10:00"
+        print("PASS  test_load_rows_timestamp_iso_values")
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Test 4: _load_config — config missing → returns {}
 # ---------------------------------------------------------------------------
 
@@ -259,6 +295,7 @@ if __name__ == "__main__":
         test_import,
         test_load_rows_missing_db,
         test_load_rows_with_db,
+        test_load_rows_timestamp_iso_values,
         test_load_config_missing,
         test_load_config_with_file,
         test_status_label,

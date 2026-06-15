@@ -51,8 +51,10 @@ def _load_rows() -> list[dict]:
     if not _DB_PATH.exists():
         return []
     try:
-        conn = sqlite3.connect(f"file:{_DB_PATH}?mode=ro", uri=True,
-                               detect_types=sqlite3.PARSE_DECLTYPES)
+        # Read raw values instead of sqlite3's TIMESTAMP converter. The
+        # shortcut counter stores ISO timestamps with a "T" separator, which
+        # sqlite3's default converter rejects.
+        conn = sqlite3.connect(f"file:{_DB_PATH}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT combo, count, last_used, category FROM shortcuts ORDER BY count DESC"
